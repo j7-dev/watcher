@@ -1,0 +1,23 @@
+{
+  "name": "watcher",
+  "owner": {
+    "name": "j7",
+    "email": "info@morepower.club"
+  },
+  "plugins": [
+    {
+      "name": "watcher",
+      "source": "./",
+      "description": "tmux pane auto-responder for Claude Code — detects idle Claude prompts and asks Codex CLI how to reply",
+      "author": {
+        "name": "j7",
+        "email": "info@morepower.club"
+      },
+      "homepage": "https://github.com/j7-dev/watcher",
+      "repository": "https://github.com/j7-dev/watcher",
+      "license": "MIT",
+      "category": "automation",
+      "keywords": ["tmux", "claude-code", "codex", "automation", "auto-reply"]
+    }
+  ]
+}
