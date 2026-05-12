@@ -362,7 +362,7 @@ class PaneState:
 
 # ---------- tmux helpers -------------------------------------------------------
 
-SEP = "\x1f"  # ASCII Unit Separator — won't appear in pane titles
+SEP = "\t"  # Tab — tmux escapes control chars < 0x20 (except tab/newline) to literal "\nnn"
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=True, **kw)
@@ -450,9 +450,17 @@ def _has_empty_input_box(screen: str) -> bool:
 
 def has_queued_input(screen: str) -> bool:
     """User has typed a draft into the input box (Claude Code displays it
-    below the box prefixed with `｜`). Auto-responder must not intervene."""
-    tail = [l for l in screen.splitlines()[-15:] if l.strip()]
-    for l in tail:
+    below the box prefixed with `｜`). Auto-responder must not intervene.
+
+    Custom statuslines (`📂` anchor) can also render lines starting with `｜`
+    (e.g. multi-line stderr previews), which would falsely look like queued
+    drafts. Queued drafts always appear *above* the statusline, so restrict
+    the search window to lines preceding the first `📂` row in the tail.
+    """
+    lines = screen.splitlines()[-15:]
+    statusline_start = next((i for i, l in enumerate(lines) if "📂" in l), len(lines))
+    candidates = [l for l in lines[:statusline_start] if l.strip()]
+    for l in candidates:
         if l.lstrip().startswith(QUEUE_MARKER):
             return True
     return False
