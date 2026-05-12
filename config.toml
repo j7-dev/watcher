@@ -3,7 +3,7 @@
 
 # ---- 輪詢 / 觸發 -----------------------------------------------------------
 # 預設架構：Claude Code Stop hook 為主觸發 (即時)，輪詢為 fallback (3 分鐘一次)。
-poll_interval_seconds      = 60    # fallback 輪詢間隔 (秒)。預設 3 分鐘
+poll_interval_seconds      = 180    # fallback 輪詢間隔 (秒)。預設 3 分鐘
 stable_count_required      = 2      # 輪詢路徑：連續幾次畫面相同才算「靜止」、可觸發 (hook 路徑會跳過)
 per_pane_cooldown_seconds  = 15     # 同一 pane 觸發後幾秒內不再觸發
 max_responses_per_window   = 5      # killswitch：時間窗內最多回應次數
@@ -45,3 +45,8 @@ log_datefmt                = "%Y-%m-%d %H:%M:%S"             # asctime 的時間
 log_max_bytes              = 10_000_000                       # 單一 watcher.log 大小上限 (byte)，超過自動 rotate
 log_backups                = 3                                # rotate 後保留幾份 (watcher.log.1, .2, ...)
 log_retention_days         = 0                                # >0 時，每小時清掉 logs/triggers/ 內 mtime 超過 N 天的檔；0 = 永久保留
+
+# 只把 audit triggers/*.json 與 codex-out-*.txt 限定在指定 pane (主 watcher.log
+# 仍全量寫)。空 list (預設) = 全部都記。可寫 "%18" 或 "18" 兩種寫法。
+# 環境變數 WATCHER_LOG_PANE_IDS="%18,%19" 用逗號分隔。
+log_pane_ids               = []

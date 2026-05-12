@@ -214,6 +214,24 @@ def _cache_store(key: str, decision: dict[str, Any], ttl: float, now: float) -> 
             _DECISION_CACHE.pop(k, None)
 
 
+def _normalize_pane_id(raw: str) -> str:
+    s = str(raw).strip()
+    if not s:
+        return ""
+    return s if s.startswith("%") else f"%{s}"
+
+
+def log_pane_allowed(pane_id: str, cfg: dict[str, Any]) -> bool:
+    """Return True if per-pane audit / codex-out logging is permitted for
+    this pane. Empty list (default) = all panes allowed."""
+    allow = cfg.get("log_pane_ids") or []
+    if not allow:
+        return True
+    wanted = {_normalize_pane_id(x) for x in allow}
+    wanted.discard("")
+    return _normalize_pane_id(pane_id) in wanted
+
+
 # ---------- config & logging ---------------------------------------------------
 
 DEFAULTS: dict[str, Any] = {
@@ -234,6 +252,7 @@ DEFAULTS: dict[str, Any] = {
     "log_max_bytes": 10_000_000,
     "log_backups": 3,
     "log_retention_days": 0,
+    "log_pane_ids": [],
     "skip_predictor_enabled": True,
     "skip_predictor_lookback_lines": 15,
     "skip_predictor_extra_markers": [],
@@ -530,7 +549,7 @@ def _strip_fences(text: str) -> str:
 async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, Any]:
     ts = int(time.time())
     safe_id = pane.pane_id.lstrip("%")
-    keep_log = bool(cfg["log_enabled"])
+    keep_log = bool(cfg["log_enabled"]) and log_pane_allowed(pane.pane_id, cfg)
     if keep_log:
         out_file = TRIGGER_DIR / f"codex-out-{ts}-{safe_id}.txt"
     else:
@@ -620,6 +639,8 @@ async def apply_action(
 
 def audit(pane: Pane, snapshot: str, decision: dict[str, Any], outcome: str, cfg: dict[str, Any]) -> None:
     if not cfg["log_enabled"]:
+        return
+    if not log_pane_allowed(pane.pane_id, cfg):
         return
     record = {
         "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),

@@ -146,12 +146,14 @@ watcher 透過 `pane_current_command == "claude"` 過濾，不會把自己誤判
 | `log_max_bytes` | `10_000_000` | `watcher.log` 大小上限（byte） |
 | `log_backups` | `3` | rotate 後保留份數 |
 | `log_retention_days` | `0` | `>0` 時每小時清 `logs/triggers/` 內 mtime 超過 N 天的檔 |
+| `log_pane_ids` | `[]` | 只把 `logs/triggers/*.json` 與 `codex-out-*.txt` 限定在指定 pane（主 `watcher.log` 仍全量）。空 = 全部都記。元素接受 `"%18"` 或 `"18"` |
 
 ### 常用 override
 
 ```bash
 WATCHER_LOG_ENABLED=true WATCHER_POLL_INTERVAL_SECONDS=60 uv run watcher.py
 WATCHER_SOCKET_ENABLED=false uv run watcher.py   # 純輪詢、停 hook 通道
+WATCHER_LOG_PANE_IDS="%18,%19" uv run watcher.py  # 只記指定 pane 的 audit
 ```
 
 ---
@@ -204,6 +206,14 @@ logs/                              # 0700，.gitignore 已加
     ├── 1715500000-3.json          # 每次觸發：快照 + codex 回覆 + 動作
     └── codex-out-*.txt
 ```
+
+要瘦身 forensic 檔，用 `log_pane_ids` 鎖定特定 pane。範例只記 `%18`：
+
+```toml
+log_pane_ids = ["%18"]            # 或 ["18"]；兩種寫法皆可
+```
+
+或 env var：`WATCHER_LOG_PANE_IDS="%18,%19"`（逗號分隔）。主 `watcher.log` 不受影響，仍全量記錄。`log_enabled = false` 仍是總開關。
 
 ---
 
