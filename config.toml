@@ -1,0 +1,30 @@
+# watcher 設定檔。整個檔案可以省略 (或刪掉任何一行)，未指定的鍵會用內建預設值。
+# 環境變數 WATCHER_<KEY> 會覆寫這裡的值；例如 `WATCHER_POLL_INTERVAL_SECONDS=2`。
+
+# ---- 輪詢 / 觸發 -----------------------------------------------------------
+# 預設架構：Claude Code Stop hook 為主觸發 (即時)，輪詢為 fallback (3 分鐘一次)。
+poll_interval_seconds      = 180    # fallback 輪詢間隔 (秒)。預設 3 分鐘
+stable_count_required      = 2      # 輪詢路徑：連續幾次畫面相同才算「靜止」、可觸發 (hook 路徑會跳過)
+per_pane_cooldown_seconds  = 15     # 同一 pane 觸發後幾秒內不再觸發
+max_responses_per_window   = 5      # killswitch：時間窗內最多回應次數
+response_window_minutes    = 5      # killswitch 的時間窗 (分鐘)
+
+# ---- Stop hook 通道 --------------------------------------------------------
+socket_enabled             = true   # 開啟 unix domain socket，讓 Claude Code Stop hook 即時觸發
+socket_path                = ""     # 空字串 = 用 $XDG_RUNTIME_DIR/watcher-$USER.sock (退路 /tmp)
+
+# ---- Codex CLI ------------------------------------------------------------
+codex_binary               = "codex"
+codex_timeout_seconds      = 90     # codex exec 單次最長等待
+
+# ---- 畫面擷取 -------------------------------------------------------------
+capture_scrollback_lines   = 200    # 每次抓畫面含多少行 scrollback
+hr_min_length              = 50     # 偵測水平線時的最小 `─` 字元數
+
+# ---- 日誌 ------------------------------------------------------------------
+log_enabled                = false                           # 整體 log 開關。預設 false (畫面快照可能含 token，預設不落地)。改 true 才會寫 watcher.log 與 triggers/*.json
+log_format                 = "%(asctime)s %(levelname)s %(message)s"  # Python logging 格式字串
+log_datefmt                = "%Y-%m-%d %H:%M:%S"             # asctime 的時間格式
+log_max_bytes              = 10_000_000                       # 單一 watcher.log 大小上限 (byte)，超過自動 rotate
+log_backups                = 3                                # rotate 後保留幾份 (watcher.log.1, .2, ...)
+log_retention_days         = 0                                # >0 時，每小時清掉 logs/triggers/ 內 mtime 超過 N 天的檔；0 = 永久保留
