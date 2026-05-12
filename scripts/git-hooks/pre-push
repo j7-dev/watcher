@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ============================================================================
+# pre-push — Auto-run scripts/release.sh on `git push` to master.
+#
+# Tracked in repo and activated via:
+#     git config core.hooksPath scripts/git-hooks
+#
+# Behaviour:
+#   - Short-circuits when RELEASING=1 (release.sh's own pushes).
+#   - Short-circuits for any push that does not target refs/heads/master.
+#   - Otherwise runs scripts/release.sh, which bumps the patch version,
+#     commits, tags, and pushes master + tag itself. We then exit 1 to
+#     cancel the original push (release.sh has already pushed).
+# ============================================================================
+set -euo pipefail
+
+if [ "${RELEASING:-}" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+pushing_master=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  [ -z "${remote_ref:-}" ] && continue
+  if [ "$remote_ref" = "refs/heads/master" ]; then
+    pushing_master=1
+  fi
+done
+
+if [ "$pushing_master" -ne 1 ]; then
+  exit 0
+fi
+
+echo "[pre-push] Push to master detected — running scripts/release.sh" >&2
+"$REPO_ROOT/scripts/release.sh"
+echo "[pre-push] release.sh already pushed master + tag; cancelling original push" >&2
+exit 1

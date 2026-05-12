@@ -102,7 +102,7 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 - `commands/*.md` 是 `/watcher:*` slash command 包裝；它們**都應該透過 `${CLAUDE_PLUGIN_ROOT}/scripts/...` 呼叫腳本**，不要自己 Edit/Write `settings.json`，會繞過 `install-hook.py` 的 `.bak` + 原子寫入。
 - Daemon 不由 plugin 啟動——使用者要從固定 clone 路徑跑 `uv run watcher.py`，因為 plugin cache 路徑會隨版本 SHA 變動。`watcher-daemon.sh` 用 `WATCHER_REPO` env var 或腳本上層目錄決定 repo 位置。
 
-**Release 自動化（推 master 即發版）**：`.git/hooks/pre-push` 偵測到推 master 會自動跑 `scripts/release.sh`：
+**Release 自動化（推 master 即發版）**：pre-push hook 追蹤在 `scripts/git-hooks/pre-push`，clone 後必須先跑一次 `git config core.hooksPath scripts/git-hooks` 才會啟用（`.git/hooks/` 不在 git 追蹤範圍內，所以走 `core.hooksPath` 才能版本管理）。啟用後推 master 會自動跑 `scripts/release.sh`：
 
 1. patch-bump `.claude-plugin/plugin.json` 的 `version`
 2. commit + 打 `vX.Y.Z` tag
