@@ -38,6 +38,8 @@ codex CLI 必須裝在 **WSL2 端**，不要從 Windows `cmd.exe` 借用。
 ```bash
 claude plugin marketplace add j7-dev/watcher
 claude plugin install watcher@watcher
+# 或 plugin 名全域唯一時可省略 @marketplace
+claude plugin install watcher
 ```
 
 **2. clone repo 跑 daemon**

@@ -3,7 +3,7 @@
 
 # ---- 輪詢 / 觸發 -----------------------------------------------------------
 # 預設架構：Claude Code Stop hook 為主觸發 (即時)，輪詢為 fallback (3 分鐘一次)。
-poll_interval_seconds      = 180    # fallback 輪詢間隔 (秒)。預設 3 分鐘
+poll_interval_seconds      = 60    # fallback 輪詢間隔 (秒)。預設 3 分鐘
 stable_count_required      = 2      # 輪詢路徑：連續幾次畫面相同才算「靜止」、可觸發 (hook 路徑會跳過)
 per_pane_cooldown_seconds  = 15     # 同一 pane 觸發後幾秒內不再觸發
 max_responses_per_window   = 5      # killswitch：時間窗內最多回應次數
@@ -17,12 +17,29 @@ socket_path                = ""     # 空字串 = 用 $XDG_RUNTIME_DIR/watcher-$
 codex_binary               = "codex"
 codex_timeout_seconds      = 90     # codex exec 單次最長等待
 
+# ---- 預測 skip / 決策快取 (省 token) -------------------------------------
+# 兩道便宜的前置過濾，避免畫面明顯不需要回答時還呼叫 Codex：
+#   1) decision cache：codex 一旦回 skip，把 (清理後畫面 hash → 決策) 存進記憶體，
+#      TTL 內同一畫面再出現直接短路。
+#   2) skip 啟發式預測器：若分類為 `input`，但畫面回看視窗內找不到任何「問題標記」
+#      (問號 / Do you / Continue / 是否 / 編號列表 ...)，視為閒置 prompt，直接短路。
+# 觸發短路時 audit log 寫 outcome=cached-skip 或 predicted-skip。
+skip_predictor_enabled          = true   # 關掉就只剩 cache 兜底
+skip_predictor_lookback_lines   = 15     # 從 ❯ 往上看幾行非空行
+skip_decision_cache_ttl_seconds = 300    # 0 = 不快取
+
+# 自訂額外問題標記 (小寫子字串比對；命中即視為畫面有問題、會打 Codex)。
+# 內建已含：?, ？, do you, would you, continue, confirm, press, choose,
+# select, y/n, 是否, 要不要, 請選, 請輸入, 請問, 確認 ...等。
+# 環境變數 WATCHER_SKIP_PREDICTOR_EXTRA_MARKERS 用逗號分隔。
+skip_predictor_extra_markers    = []
+
 # ---- 畫面擷取 -------------------------------------------------------------
 capture_scrollback_lines   = 200    # 每次抓畫面含多少行 scrollback
 hr_min_length              = 50     # 偵測水平線時的最小 `─` 字元數
 
 # ---- 日誌 ------------------------------------------------------------------
-log_enabled                = false                           # 整體 log 開關。預設 false (畫面快照可能含 token，預設不落地)。改 true 才會寫 watcher.log 與 triggers/*.json
+log_enabled                = true                            # 整體 log 開關。預設 false (畫面快照可能含 token，預設不落地)。改 true 才會寫 watcher.log 與 triggers/*.json
 log_format                 = "%(asctime)s %(levelname)s %(message)s"  # Python logging 格式字串
 log_datefmt                = "%Y-%m-%d %H:%M:%S"             # asctime 的時間格式
 log_max_bytes              = 10_000_000                       # 單一 watcher.log 大小上限 (byte)，超過自動 rotate

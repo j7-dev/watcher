@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -45,15 +46,26 @@ Decide ONE action and reply with JSON matching the provided schema. The
   - action="enter"  value=null                    → press Enter only (accept default)
   - action="skip"   value=<short reason>          → refuse to respond (ambiguous/dangerous)
 
-Be conservative: choose "skip" if the prompt is ambiguous, asks for destructive
-actions, requires project knowledge you don't have, or you cannot identify a
-clearly correct answer from the screen alone. You have NO context beyond the
-screen below; do not invent details.
+PREFER MAKING A DECISION OVER SKIPPING. You have NO context beyond the screen
+below; do not invent details, but do use what is visible.
 
-If the pane shows a numbered menu (e.g. "1. Yes  2. No  3. ..."), prefer
-action="key" with the matching digit. If it shows a free-text input box (an
-empty `❯` line bracketed by horizontal rules), prefer action="text" with a
-concise reply. If unsure, "skip".
+Decision rules:
+  - If the screen shows numbered options (e.g. "1. ... 2. ..."), PICK ONE.
+    When the choice is between an elevated-permission path (sudo, root, system
+    package install, modifying global state) and a software-only fallback that
+    achieves the same goal, prefer the fallback unless the screen explicitly
+    states the elevated path is required or preferred.
+  - For a `❯` free-text input box, prefer action="text" with a concise reply
+    that answers the visible question. If the latest question is a clear yes/no
+    or one-word check, answer it directly.
+  - For an `❯ 1.` style menu line, prefer action="key" with the matching digit.
+
+Skip ONLY when one of these holds:
+  1. The prompt asks for information you cannot possibly infer from the screen
+     (passwords, API keys, secrets, personal data).
+  2. Acting wrong would lose work irreversibly (rm -rf, force-push, DROP TABLE,
+     git reset --hard on dirty tree, deleting branches with unmerged commits).
+  3. No actual question or menu is visible — the pane is just idle.
 
 --- SCREEN CAPTURE (between fences) ---
 ```
@@ -63,6 +75,28 @@ concise reply. If unsure, "skip".
 
 MENU_CHOICE_RE = re.compile(r"^\s*❯\s+\d+[.)\]]")
 HR_DASH_THRESHOLD = 50  # min count of `─` chars on a line to call it a horizontal rule
+
+# Built-in question markers checked by the pre-codex skip predictor. A captured
+# screen that classifies as `input` but contains NONE of these (and no numbered
+# list line) in the lookback window is assumed to be an idle pane with no
+# pending question — codex would almost certainly answer "skip", so we short-
+# circuit and save the round-trip. Users can extend via
+# config.skip_predictor_extra_markers (case-insensitive substring match).
+DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
+    "?", "？",
+    "do you", "would you", "shall i", "should i",
+    "continue", "confirm", "proceed", "approve",
+    "press", "choose", "select", "pick",
+    "y/n", "yes/no", "(y/n)",
+    "是否", "要不要", "請選", "請輸入", "請問", "確認",
+)
+NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
+
+# Module-level decision cache: screen-hash → (expiry_ts, decision_dict).
+# Only `skip` decisions are stored; other actions mutate the pane so the same
+# screen won't recur. Cache is in-memory and dies with the daemon.
+_DECISION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CACHE_MAX_ENTRIES = 256
 
 
 def is_hr_line(line: str) -> bool:
@@ -84,7 +118,100 @@ def is_empty_prompt_line(line: str) -> bool:
 
 WORKING_HINTS = ("esc to interrupt", "(ctrl+o to expand)")
 
+# Claude Code shows queued draft messages below the input box prefixed with
+# fullwidth `｜` (U+FF5C). When present the user has already typed their next
+# reply — auto-responder should leave the pane alone.
+QUEUE_MARKER = "｜"
+
+# ---------- chrome filter for codex prompt ------------------------------------
+# Strip pane chrome that adds noise without information (welcome banner, status
+# line, footer hints, spinner counters) so codex sees only the conversation.
+_WELCOME_MARKERS = ("Welcome back", "Tips for getting started", "/release-notes for more")
+_STATUSLINE_RE = re.compile(r"📂")               # status line: model badge/dir/branch (📂 is unique anchor)
+_FOOTER_RE     = re.compile(r"^\s*⏵⏵\s+(bypass|auto-accept)")  # bottom mode hint
+_BAKED_RE      = re.compile(r"^\s*✻\s+\w+\s+for\s+")            # spinner counter line
+_TOKEN_RE      = re.compile(r"^\s*\d+\s+tokens\s*$")            # `114738 tokens` line
+
+
+def _clean_screen(screen: str) -> str:
+    lines = screen.splitlines()
+    start = 0
+    head = "\n".join(lines[:25])
+    if any(m in head for m in _WELCOME_MARKERS):
+        for i, l in enumerate(lines[:30]):
+            if l.lstrip().startswith("╰"):
+                start = i + 1
+                break
+    kept = []
+    for l in lines[start:]:
+        if _STATUSLINE_RE.search(l):
+            continue
+        if _FOOTER_RE.match(l):
+            continue
+        if _BAKED_RE.match(l):
+            continue
+        if _TOKEN_RE.match(l):
+            continue
+        kept.append(l)
+    return "\n".join(kept).strip("\n")
+
 log = logging.getLogger("watcher")
+
+
+# ---------- skip predictor & decision cache -----------------------------------
+
+def _build_markers(cfg: dict[str, Any]) -> list[str]:
+    extras = cfg.get("skip_predictor_extra_markers") or []
+    extra_lc = [str(m).lower() for m in extras if str(m).strip()]
+    return [*DEFAULT_QUESTION_MARKERS, *extra_lc]
+
+
+def predict_skip(
+    clean_screen: str,
+    classification: str,
+    lookback: int,
+    markers: list[str],
+) -> str | None:
+    """Return a reason string when we predict codex would answer `skip`,
+    otherwise None. Only fires for `input` classification — `menu` screens
+    always carry numbered choices so they are answerable."""
+    if classification != "input":
+        return None
+    nonempty = [l for l in clean_screen.splitlines() if l.strip()]
+    if not nonempty:
+        return "empty cleaned screen"
+    window = nonempty[-max(lookback, 1):]
+    haystack = "\n".join(window).lower()
+    if any(m in haystack for m in markers):
+        return None
+    if any(NUMBERED_LIST_RE.match(l) for l in window):
+        return None
+    return f"no question marker in last {len(window)} non-empty line(s)"
+
+
+def _screen_hash(clean_screen: str) -> str:
+    return hashlib.sha256(clean_screen.encode("utf-8")).hexdigest()
+
+
+def _cache_lookup(key: str, now: float) -> dict[str, Any] | None:
+    entry = _DECISION_CACHE.get(key)
+    if entry is None:
+        return None
+    expiry, decision = entry
+    if now >= expiry:
+        _DECISION_CACHE.pop(key, None)
+        return None
+    return decision
+
+
+def _cache_store(key: str, decision: dict[str, Any], ttl: float, now: float) -> None:
+    if ttl <= 0:
+        return
+    _DECISION_CACHE[key] = (now + ttl, decision)
+    if len(_DECISION_CACHE) > _CACHE_MAX_ENTRIES:
+        stale = [k for k, (exp, _) in _DECISION_CACHE.items() if exp <= now]
+        for k in stale:
+            _DECISION_CACHE.pop(k, None)
 
 
 # ---------- config & logging ---------------------------------------------------
@@ -107,6 +234,10 @@ DEFAULTS: dict[str, Any] = {
     "log_max_bytes": 10_000_000,
     "log_backups": 3,
     "log_retention_days": 0,
+    "skip_predictor_enabled": True,
+    "skip_predictor_lookback_lines": 15,
+    "skip_predictor_extra_markers": [],
+    "skip_decision_cache_ttl_seconds": 300,
 }
 
 
@@ -128,6 +259,8 @@ def _coerce(default: Any, raw: str) -> Any:
         return int(raw)
     if isinstance(default, float):
         return float(raw)
+    if isinstance(default, list):
+        return [s.strip() for s in raw.split(",") if s.strip()]
     return raw
 
 
@@ -296,9 +429,21 @@ def _has_empty_input_box(screen: str) -> bool:
     return False
 
 
+def has_queued_input(screen: str) -> bool:
+    """User has typed a draft into the input box (Claude Code displays it
+    below the box prefixed with `｜`). Auto-responder must not intervene."""
+    tail = [l for l in screen.splitlines()[-15:] if l.strip()]
+    for l in tail:
+        if l.lstrip().startswith(QUEUE_MARKER):
+            return True
+    return False
+
+
 def classify(screen: str, title: str) -> str:
     if is_working(screen, title):
         return "working"
+    if has_queued_input(screen):
+        return "drafting"
     tail_lines = screen.splitlines()[-30:]
     if any(MENU_CHOICE_RE.match(l) for l in tail_lines):
         return "menu"
@@ -370,7 +515,7 @@ def evaluate_pane(
 # ---------- codex invocation ---------------------------------------------------
 
 def build_prompt(screen: str) -> str:
-    return PROMPT_TEMPLATE.format(screen=screen)
+    return PROMPT_TEMPLATE.format(screen=_clean_screen(screen))
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
@@ -502,13 +647,48 @@ async def handle_pane(
     try:
         async with state.lock:
             log.info("trigger %s class=%s title=%r", pane.target, state.last_classification, pane.title)
+
+            # Pre-codex short-circuits: cache hit, then heuristic skip predictor.
+            clean = _clean_screen(snapshot)
+            shash = _screen_hash(clean)
+            cache_ttl = float(cfg["skip_decision_cache_ttl_seconds"])
+            cooldown = float(cfg["per_pane_cooldown_seconds"])
+            pre_now = time.time()
+            cached = _cache_lookup(shash, pre_now)
+            if cached is not None:
+                log.info("cache hit for %s: %s", pane.target, cached.get("action"))
+                state.cooldown_until = pre_now + cooldown
+                cached_decision = {**cached, "source": "cache"}
+                try:
+                    audit(pane, snapshot, cached_decision, "cached-skip", cfg)
+                except Exception:
+                    log.exception("audit write failed")
+                return
+            if bool(cfg["skip_predictor_enabled"]):
+                reason = predict_skip(
+                    clean,
+                    state.last_classification,
+                    int(cfg["skip_predictor_lookback_lines"]),
+                    _build_markers(cfg),
+                )
+                if reason:
+                    log.info("predicted skip for %s: %s", pane.target, reason)
+                    state.cooldown_until = pre_now + cooldown
+                    decision = {"action": "skip", "value": reason, "source": "predicted"}
+                    _cache_store(shash, decision, cache_ttl, pre_now)
+                    try:
+                        audit(pane, snapshot, decision, "predicted-skip", cfg)
+                    except Exception:
+                        log.exception("audit write failed")
+                    return
+
             try:
                 decision = await call_codex(pane, snapshot, cfg)
             except Exception as e:
                 log.error("codex call failed for %s: %s", pane.target, e)
                 now = time.time()
                 state.responses_in_window.append(now)
-                state.cooldown_until = now + float(cfg["per_pane_cooldown_seconds"])
+                state.cooldown_until = now + cooldown
                 try:
                     audit(pane, snapshot, {"action": "error", "error": str(e)[:500]}, "codex-error", cfg)
                 except Exception:
@@ -517,6 +697,8 @@ async def handle_pane(
             action = decision.get("action", "")
             value = decision.get("value")
             log.info("codex decision for %s: action=%s value=%r", pane.target, action, value)
+            if action == "skip":
+                _cache_store(shash, dict(decision), cache_ttl, time.time())
             if dry_run:
                 outcome = f"dry-run:{action}:{(value or '')[:80]}"
             else:
