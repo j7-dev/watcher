@@ -1,6 +1,6 @@
 {
   "name": "watcher",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "tmux pane auto-responder for Claude Code — detects idle Claude prompts and asks Codex CLI how to reply",
   "author": {
     "name": "j7",
