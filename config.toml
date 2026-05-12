@@ -3,7 +3,7 @@
 
 # ---- 輪詢 / 觸發 -----------------------------------------------------------
 # 預設架構：Claude Code Stop hook 為主觸發 (即時)，輪詢為 fallback (3 分鐘一次)。
-poll_interval_seconds      = 180    # fallback 輪詢間隔 (秒)。預設 3 分鐘
+poll_interval_seconds      = 60    # fallback 輪詢間隔 (秒)。預設 3 分鐘
 stable_count_required      = 2      # 輪詢路徑：連續幾次畫面相同才算「靜止」、可觸發 (hook 路徑會跳過)
 per_pane_cooldown_seconds  = 15     # 同一 pane 觸發後幾秒內不再觸發
 max_responses_per_window   = 5      # killswitch：時間窗內最多回應次數
