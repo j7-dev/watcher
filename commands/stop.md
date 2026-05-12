@@ -3,8 +3,8 @@ description: Stop the watcher daemon (kill the tmux session + watcher.py process
 ---
 
 Stop the watcher daemon: kill the `watcher` tmux session if present, then
-send SIGTERM to any remaining `watcher.py` processes (SIGKILL after 1 s if
-they ignore the term).
+send SIGTERM to any remaining `watcher.py` processes inside that tmux
+session (SIGKILL after 1 s if they ignore the term).
 
 Run exactly:
 
@@ -18,7 +18,9 @@ After running:
   (the script prints `not running`). Report stdout verbatim.
 - Exit code non-zero: print the stderr output and stop.
 
-Note: `pgrep -f watcher.py` matches **every** process on the host whose
-command line contains `watcher.py`. If the user has unrelated processes by
-that name, this command will signal them too. Mention this caveat only if
-the user reports unexpected casualties.
+Scope: process detection is restricted to the Unix session id (SID) of the
+`watcher` tmux pane. A foreground `uv run watcher.py` launched from the
+user's own shell (outside this tmux session) will **not** be detected or
+signalled — that is intentional, so an autonomous Claude invocation of
+this command cannot kill a developer's foreground instance. If the user
+asks why a foreground watcher kept running after `stop`, explain this.

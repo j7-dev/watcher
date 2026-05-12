@@ -12,9 +12,11 @@
 #      plugin cache, since both layouts ship watcher.py at the repo root)
 #
 # Daemon lifecycle: a detached tmux session named "$SESSION" runs
-# `uv run watcher.py` from the repo dir. Process detection uses
-# `pgrep -f watcher.py` — note that multiple watcher.py instances on the host
-# will all be counted.
+# `uv run watcher.py` from the repo dir. Process detection is scoped to the
+# Unix session id (SID) of the tmux pane — so foreground `uv run watcher.py`
+# instances launched outside this tmux session are NOT detected, started,
+# or signalled. This is intentional: prevents another Claude Code session
+# from `bash watcher-daemon.sh stop`-ing your foreground dev instance.
 
 set -euo pipefail
 
@@ -29,10 +31,25 @@ fi
 cmd="${1:-status}"
 
 pids() {
+  # Scope detection to processes inside the "$SESSION" tmux pane only.
+  # We grab the pane's Unix session id (SID) and ask pgrep for watcher.py
+  # processes in that SID. Processes outside the tmux session (e.g. a
+  # foreground `uv run watcher.py` in your own shell) live in a different
+  # SID and are deliberately ignored.
+  #
   # `[w]atcher\.py` matches the literal string "watcher.py" but the pattern
   # itself contains "[w]atcher.py", which doesn't match — so pgrep won't
   # find its own parent shell when invoked via `bash -c` / eval wrappers.
-  pgrep -f "[w]atcher\.py" || true
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    return 0
+  fi
+  local pane_pid
+  pane_pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -n1)"
+  [[ -z "$pane_pid" ]] && return 0
+  local sid
+  sid="$(ps -o sid= -p "$pane_pid" 2>/dev/null | tr -d ' ')"
+  [[ -z "$sid" ]] && return 0
+  pgrep -s "$sid" -f "[w]atcher\.py" 2>/dev/null || true
 }
 
 socket_path() {
@@ -43,9 +60,9 @@ case "$cmd" in
   status)
     p="$(pids | tr '\n' ' ')"
     if [[ -n "${p// }" ]]; then
-      echo "daemon: running (pid ${p% })"
+      echo "daemon: running in tmux session '$SESSION' (pid ${p% })"
     else
-      echo "daemon: not running"
+      echo "daemon: no tmux-managed daemon in session '$SESSION'"
     fi
     if tmux has-session -t "$SESSION" 2>/dev/null; then
       echo "tmux:   session '$SESSION' present (attach: tmux attach -t $SESSION)"
@@ -55,6 +72,11 @@ case "$cmd" in
     sock="$(socket_path)"
     if [[ -S "$sock" ]]; then
       echo "socket: $sock"
+      if [[ -z "${p// }" ]]; then
+        # Live socket but no tmux-session daemon → likely a foreground
+        # `uv run watcher.py` outside this script's reach.
+        echo "note:   socket is live but daemon is out-of-session (foreground?) — this script will not signal it"
+      fi
     else
       echo "socket: absent ($sock)"
     fi
@@ -66,6 +88,15 @@ case "$cmd" in
     existing="$(pids | tr '\n' ' ')"
     if [[ -n "${existing// }" ]]; then
       echo "already running (pid ${existing% })"
+      exit 0
+    fi
+    # Detect an out-of-session watcher (e.g. foreground `uv run watcher.py`)
+    # via a live socket. Starting a tmux daemon on top of it would silently
+    # hijack the socket — refuse instead.
+    sock="$(socket_path)"
+    if [[ -S "$sock" ]]; then
+      echo "already running outside tmux session '$SESSION' (live socket: $sock)"
+      echo "this start is a no-op; stop the other instance first if you want a tmux-managed daemon"
       exit 0
     fi
     if [[ ! -f "$REPO/watcher.py" ]]; then
@@ -117,13 +148,22 @@ case "$cmd" in
         kill -TERM "$pid" 2>/dev/null || true
       done
       sleep 1
-      remaining="$(pids | tr '\n' ' ')"
+      # `pids()` is now tmux-session-scoped, and we already killed the
+      # session above — so we re-check the originally captured PIDs
+      # individually with `kill -0` instead of calling `pids()` again.
+      remaining=""
+      for pid in $p; do
+        if kill -0 "$pid" 2>/dev/null; then
+          remaining="$remaining $pid"
+        fi
+      done
+      remaining="${remaining# }"
       pretty_p="$(echo "$p" | tr '\n' ' ')"
-      if [[ -n "${remaining// }" ]]; then
+      if [[ -n "$remaining" ]]; then
         for pid in $remaining; do
           kill -KILL "$pid" 2>/dev/null || true
         done
-        echo "force-killed pid(s): ${remaining% }"
+        echo "force-killed pid(s): $remaining"
       else
         echo "stopped pid(s): ${pretty_p% }"
       fi
