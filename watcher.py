@@ -399,13 +399,68 @@ def discover_panes(my_pid: int) -> list[Pane]:
     return panes
 
 
+_ANSI_CSI_RE = re.compile(r"\x1b\[([0-9;?]*)([a-zA-Z])")
+
+
+def _strip_ghost_text(raw: str) -> str:
+    """Remove characters rendered with SGR dim (\\e[2m) or reverse-video
+    (\\e[7m) attributes, then strip all remaining ANSI escapes. Claude Code
+    paints autocomplete/ghost-text suggestions in dim and parks the cursor on
+    the first suggested character with reverse-video — both indistinguishable
+    from real input once SGR codes are stripped. Dropping these chars makes a
+    ghosted `❯ <suggestion>` line collapse back to an empty prompt so
+    `classify()` sees the true idle state.
+
+    Side effect: a real cursor reverse-video block (almost always sitting on
+    the trailing whitespace after typed input) also gets dropped — harmless
+    because typed input is the non-reversed prefix.
+    """
+    out: list[str] = []
+    dim = False
+    reverse = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\x1b" and i + 1 < n and raw[i + 1] == "[":
+            m = _ANSI_CSI_RE.match(raw, i)
+            if m:
+                params, final = m.group(1), m.group(2)
+                if final == "m":
+                    parts = params.split(";") if params else ["0"]
+                    for p in parts:
+                        p = p or "0"
+                        if p == "0":
+                            dim = False
+                            reverse = False
+                        elif p == "2":
+                            dim = True
+                        elif p == "22":
+                            dim = False
+                        elif p == "7":
+                            reverse = True
+                        elif p == "27":
+                            reverse = False
+                i = m.end()
+                continue
+        if ch == "\x1b":
+            i += 1
+            continue
+        if dim or reverse:
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def capture_pane(target: str, scrollback: int = 200) -> str:
     try:
-        out = _run(["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{scrollback}"]).stdout
+        out = _run(["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", f"-{scrollback}"]).stdout
     except subprocess.CalledProcessError as e:
         log.warning("capture-pane %s failed: %s", target, e.stderr.strip())
         return ""
-    return out
+    return _strip_ghost_text(out)
 
 
 # ---------- classification -----------------------------------------------------
