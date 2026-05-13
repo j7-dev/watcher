@@ -24,6 +24,7 @@ it never blocks the Claude Code turn.
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 import sys
@@ -47,7 +48,8 @@ def main() -> int:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(1.0)
         s.connect(sock_path)
-        s.sendall((pane + "\n").encode("utf-8"))
+        payload = json.dumps({"v": 1, "event": "stop", "pane": pane}, ensure_ascii=False)
+        s.sendall((payload + "\n").encode("utf-8"))
         s.close()
     except OSError:
         pass

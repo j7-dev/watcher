@@ -55,10 +55,19 @@ Decision rules:
     package install, modifying global state) and a software-only fallback that
     achieves the same goal, prefer the fallback unless the screen explicitly
     states the elevated path is required or preferred.
+  - When the same affirmative action is offered as both a one-time approval
+    ("Yes", "Yes, proceed") and a permanent approval ("Yes, and don't ask
+    again", "Always allow"), ALWAYS prefer the one-time option. Permanent
+    approvals remove future checkpoints and are hard to reverse.
   - For a `❯` free-text input box, prefer action="text" with a concise reply
     that answers the visible question. If the latest question is a clear yes/no
     or one-word check, answer it directly.
   - For an `❯ 1.` style menu line, prefer action="key" with the matching digit.
+  - Plan Mode confirmation (Claude proposes a multi-step plan and asks to
+    proceed): if the visible plan content looks complete and reasonable,
+    approve it. If the plan box appears truncated at the top (you can see a
+    closing `╰` border without a matching `╭` opener), pick the "No, keep
+    planning" option instead of approving blindly.
 
 Skip ONLY when one of these holds:
   1. The prompt asks for information you cannot possibly infer from the screen
@@ -243,6 +252,9 @@ DEFAULTS: dict[str, Any] = {
     "codex_timeout_seconds": 90,
     "codex_binary": "codex",
     "capture_scrollback_lines": 200,
+    "capture_escalation_step": 400,
+    "max_capture_scrollback_lines": 2000,
+    "prompt_context_lines": 60,
     "hr_min_length": 50,
     "socket_enabled": True,
     "socket_path": "",
@@ -257,6 +269,10 @@ DEFAULTS: dict[str, Any] = {
     "skip_predictor_lookback_lines": 15,
     "skip_predictor_extra_markers": [],
     "skip_decision_cache_ttl_seconds": 300,
+    "milestone_toggle_state_path": "",
+    "milestone_command_text": "/milestone-runner",
+    "milestone_max_reinjects_per_window": 5,
+    "milestone_reinject_cooldown_seconds": 5,
 }
 
 
@@ -463,6 +479,90 @@ def capture_pane(target: str, scrollback: int = 200) -> str:
     return _strip_ghost_text(out)
 
 
+_TRUNCATION_BOTTOM_WINDOW = 15  # how far up from the bottom we still treat a `╰` as "current"
+
+
+def is_capture_truncated(screen: str) -> bool:
+    """Heuristic: Claude Code draws bordered boxes for plan confirmations,
+    permission dialogs, and other multi-line prompts. Top border opens with
+    `╭`, bottom closes with `╰`. The current prompt's `╰` always sits near
+    the bottom (the menu/input lines beneath it are short). Look for a `╰`
+    in the last `_TRUNCATION_BOTTOM_WINDOW` lines only; older completed
+    boxes higher up are ignored on purpose (dragging more history just
+    pollutes codex's view of the current decision). If that bottom `╰` has
+    no matching `╭` anywhere in the capture, the current box is cut off →
+    escalate scrollback.
+    """
+    lines = screen.splitlines()
+    n = len(lines)
+    bottom_floor = max(0, n - _TRUNCATION_BOTTOM_WINDOW)
+    last_close = -1
+    for i in range(n - 1, bottom_floor - 1, -1):
+        if "╰" in lines[i]:
+            last_close = i
+            break
+    if last_close < 0:
+        return False
+    for j in range(last_close - 1, -1, -1):
+        if "╭" in lines[j]:
+            return False
+    return True
+
+
+def _trim_to_current_decision(screen: str, fallback_lines: int) -> str:
+    """Reduce the screen to only the current decision's context before it
+    is sent to codex. Two cases:
+
+    1. The current prompt is wrapped in a bordered box (plan confirmation,
+       permission dialog, etc.) whose `╰` sits within the bottom window:
+       keep from that box's matching `╭` downward. Everything above is
+       older conversation and gets dropped.
+    2. No current-decision box detected (plain input box, bare numbered
+       menu, or any older `╰` higher up): keep only the last
+       `fallback_lines` lines — enough to include Claude's most recent
+       question without dragging in earlier turns.
+    """
+    lines = screen.splitlines()
+    n = len(lines)
+    bottom_floor = max(0, n - _TRUNCATION_BOTTOM_WINDOW)
+    last_close = -1
+    for i in range(n - 1, bottom_floor - 1, -1):
+        if "╰" in lines[i]:
+            last_close = i
+            break
+    if last_close >= 0:
+        for j in range(last_close - 1, -1, -1):
+            if "╭" in lines[j]:
+                return "\n".join(lines[j:])
+    if fallback_lines <= 0 or n <= fallback_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[-fallback_lines:])
+
+
+def capture_pane_adaptive(target: str, cfg: dict[str, Any]) -> str:
+    """Capture pane content, escalating scrollback if a bordered box is
+    detected as truncated above the captured window. Stops when no longer
+    truncated, when scrollback hits max, or when a larger capture returns
+    identical content (tmux history exhausted).
+    """
+    scrollback = int(cfg["capture_scrollback_lines"])
+    max_sb = int(cfg["max_capture_scrollback_lines"])
+    step = int(cfg["capture_escalation_step"])
+    screen = capture_pane(target, scrollback)
+    if not screen:
+        return screen
+    while is_capture_truncated(screen) and scrollback < max_sb:
+        next_sb = min(scrollback + step, max_sb)
+        bigger = capture_pane(target, next_sb)
+        if not bigger or bigger == screen:
+            break
+        log.info("escalated scrollback %d → %d for %s (truncated box)",
+                 scrollback, next_sb, target)
+        screen = bigger
+        scrollback = next_sb
+    return screen
+
+
 # ---------- classification -----------------------------------------------------
 
 def is_spinner_title(title: str) -> bool:
@@ -574,12 +674,11 @@ def evaluate_pane(
     state: PaneState,
     cfg: dict[str, Any],
     dry_run: bool,
-    scrollback: int,
     from_hook: bool = False,
 ) -> bool:
     """Capture pane, classify, and schedule handle_pane if conditions met.
     Returns True if a handler was scheduled."""
-    screen = capture_pane(pane.target, scrollback)
+    screen = capture_pane_adaptive(pane.target, cfg)
     if not screen:
         return False
     state.history.append(screen)
@@ -596,8 +695,11 @@ def evaluate_pane(
 
 # ---------- codex invocation ---------------------------------------------------
 
-def build_prompt(screen: str) -> str:
-    return PROMPT_TEMPLATE.format(screen=_clean_screen(screen))
+def build_prompt(screen: str, cfg: dict[str, Any]) -> str:
+    cleaned = _clean_screen(screen)
+    fallback = int(cfg.get("prompt_context_lines", 60))
+    trimmed = _trim_to_current_decision(cleaned, fallback)
+    return PROMPT_TEMPLATE.format(screen=trimmed)
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
@@ -619,7 +721,7 @@ async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, 
         fd, tmp_path = tempfile.mkstemp(prefix=f"codex-out-{ts}-{safe_id}-", suffix=".txt")
         os.close(fd)
         out_file = Path(tmp_path)
-    full_prompt = build_prompt(screen)
+    full_prompt = build_prompt(screen, cfg)
 
     args = [
         cfg.get("codex_binary", "codex"), "exec",
@@ -806,6 +908,144 @@ async def handle_pane(
         state.in_flight = False
 
 
+# ---------- milestone-toggle bridge --------------------------------------------
+
+def _toggle_state_root() -> Path:
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    if base:
+        return Path(base) / "watcher"
+    return Path.home() / ".local" / "state" / "watcher"
+
+
+def resolve_toggle_state_path(cfg: dict[str, Any]) -> Path:
+    override = str(cfg.get("milestone_toggle_state_path", "")).strip()
+    if override:
+        return Path(override).expanduser()
+    return _toggle_state_root() / "milestone-toggle.json"
+
+
+def resolve_completion_marker_dir(cfg: dict[str, Any]) -> Path:
+    return _toggle_state_root() / "milestone-done"
+
+
+def read_toggle_state(cfg: dict[str, Any]) -> dict[str, Any]:
+    path = resolve_toggle_state_path(cfg)
+    if not path.exists():
+        return {"version": 1, "panes": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("milestone-toggle state unreadable %s: %s", path, e)
+        return {"version": 1, "panes": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "panes": {}}
+    data.setdefault("version", 1)
+    if not isinstance(data.get("panes"), dict):
+        data["panes"] = {}
+    return data
+
+
+def write_toggle_state(data: dict[str, Any], cfg: dict[str, Any]) -> None:
+    path = resolve_toggle_state_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def completion_marker_fresh(pane_id: str, entry: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    marker = resolve_completion_marker_dir(cfg) / f"{pane_id}.json"
+    if not marker.exists():
+        return False
+    enabled_at = entry.get("enabled_at", "")
+    try:
+        enabled_ts = dt.datetime.fromisoformat(str(enabled_at)).timestamp()
+    except (TypeError, ValueError):
+        return False
+    try:
+        mtime = marker.stat().st_mtime
+    except OSError:
+        return False
+    return mtime > enabled_ts
+
+
+def _milestone_rate_limit_ok(entry: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    window_min = float(cfg.get("response_window_minutes", 5))
+    max_n = int(cfg.get("milestone_max_reinjects_per_window", 5))
+    now = time.time()
+    cutoff = now - window_min * 60.0
+    raw = entry.get("reinjects") or []
+    fresh = [t for t in raw if isinstance(t, (int, float)) and t >= cutoff]
+    entry["reinjects"] = fresh
+    return len(fresh) < max_n
+
+
+async def handle_milestone_event(
+    pane_id: str,
+    states: dict[str, PaneState],
+    cfg: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """Toggle ON for this pane. Re-inject the milestone command unless the
+    completion marker says we are done, the pane is busy, or rate-limit trips."""
+    state_data = read_toggle_state(cfg)
+    entry = state_data.get("panes", {}).get(pane_id)
+    if not entry or not entry.get("enabled"):
+        return
+    if completion_marker_fresh(pane_id, entry, cfg):
+        entry["enabled"] = False
+        entry["completed_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        write_toggle_state(state_data, cfg)
+        log.info("milestone-toggle auto-off pane=%s (completion marker)", pane_id)
+        return
+    panes = discover_panes(os.getpid())
+    pane = next((p for p in panes if p.pane_id == pane_id), None)
+    if pane is None:
+        log.info("milestone-toggle: pane %s not found; skipping", pane_id)
+        return
+    expected_window = entry.get("session_window")
+    if expected_window and pane.target != expected_window:
+        log.warning("milestone-toggle: pane %s window changed (%s -> %s); auto-off",
+                    pane_id, expected_window, pane.target)
+        entry["enabled"] = False
+        write_toggle_state(state_data, cfg)
+        return
+    state = states.setdefault(pane_id, PaneState())
+    screen = capture_pane_adaptive(pane.target, cfg)
+    if not screen:
+        return
+    cls = classify(screen, pane.title)
+    if cls in ("working", "drafting"):
+        log.info("milestone-toggle: pane %s busy (class=%s); skipping inject", pane_id, cls)
+        return
+    if not _milestone_rate_limit_ok(entry, cfg):
+        log.warning("milestone-toggle killswitch pane=%s (>= %d injects in %.1f min)",
+                    pane_id,
+                    int(cfg["milestone_max_reinjects_per_window"]),
+                    float(cfg["response_window_minutes"]))
+        entry["enabled"] = False
+        write_toggle_state(state_data, cfg)
+        return
+    cmd = str(cfg.get("milestone_command_text") or "/milestone-runner")
+    if dry_run:
+        log.info("milestone-toggle: dry-run inject %r into %s", cmd, pane.target)
+        entry.setdefault("reinjects", []).append(time.time())
+        write_toggle_state(state_data, cfg)
+        return
+    try:
+        _run(["tmux", "send-keys", "-t", pane.target, "-l", cmd])
+        await asyncio.sleep(0.15)
+        _run(["tmux", "send-keys", "-t", pane.target, "Enter"])
+    except subprocess.CalledProcessError as e:
+        log.warning("milestone-toggle: send-keys failed for %s: %s", pane.target,
+                    (e.stderr or "").strip())
+        return
+    state.cooldown_until = time.time() + float(cfg["milestone_reinject_cooldown_seconds"])
+    entry.setdefault("reinjects", []).append(time.time())
+    write_toggle_state(state_data, cfg)
+    log.info("milestone-toggle: injected %r into %s", cmd, pane.target)
+
+
 # ---------- hook socket server -------------------------------------------------
 
 async def handle_hook_event(
@@ -821,9 +1061,7 @@ async def handle_hook_event(
         log.info("hook event for unknown pane %s; ignored", pane_id)
         return
     state = states.setdefault(pane.pane_id, PaneState())
-    evaluate_pane(pane, state, cfg, dry_run,
-                  scrollback=int(cfg["capture_scrollback_lines"]),
-                  from_hook=True)
+    evaluate_pane(pane, state, cfg, dry_run, from_hook=True)
 
 
 async def start_socket_server(
@@ -850,11 +1088,25 @@ async def start_socket_server(
                 data = await asyncio.wait_for(reader.readline(), timeout=2.0)
             except asyncio.TimeoutError:
                 return
-            pane_id = data.decode("utf-8", "replace").strip()
+            line = data.decode("utf-8", "replace").strip()
+            if not line:
+                return
+            try:
+                msg = json.loads(line)
+                if not isinstance(msg, dict):
+                    msg = {"event": "stop", "pane": line}
+            except json.JSONDecodeError:
+                msg = {"event": "stop", "pane": line}
+            pane_id = str(msg.get("pane", "")).strip()
             if not pane_id:
                 return
             try:
-                await handle_hook_event(pane_id, states, cfg, dry_run)
+                state_data = read_toggle_state(cfg)
+                entry = state_data.get("panes", {}).get(pane_id)
+                if entry and entry.get("enabled"):
+                    await handle_milestone_event(pane_id, states, cfg, dry_run)
+                else:
+                    await handle_hook_event(pane_id, states, cfg, dry_run)
             except Exception:
                 log.exception("hook handler failed for %s", pane_id)
         finally:
@@ -887,7 +1139,6 @@ async def main_loop(
 ) -> None:
     my_pid = os.getpid()
     interval = float(cfg["poll_interval_seconds"])
-    scrollback = int(cfg["capture_scrollback_lines"])
     log.info("watcher poll loop (pid=%d, interval=%.1fs, dry_run=%s)", my_pid, interval, dry_run)
 
     pruned = prune_old_triggers(cfg)
@@ -910,7 +1161,7 @@ async def main_loop(
 
         for pane in panes:
             state = states.setdefault(pane.pane_id, PaneState())
-            evaluate_pane(pane, state, cfg, dry_run, scrollback=scrollback, from_hook=False)
+            evaluate_pane(pane, state, cfg, dry_run, from_hook=False)
 
         if time.time() - last_prune > prune_interval:
             pruned = prune_old_triggers(cfg)
@@ -956,9 +1207,8 @@ async def run_once(cfg: dict[str, Any]) -> int:
     if not panes:
         print("no claude panes found")
         return 0
-    scrollback = int(cfg["capture_scrollback_lines"])
     for p in panes:
-        screen = capture_pane(p.target, scrollback)
+        screen = capture_pane_adaptive(p.target, cfg)
         cls = classify(screen, p.title)
         print(f"{p.target}  pane={p.pane_id}  pid={p.pid}  class={cls}  title={p.title!r}")
     return 0
