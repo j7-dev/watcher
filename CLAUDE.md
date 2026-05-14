@@ -51,10 +51,9 @@ $env:WATCHER_SOCKET_PORT = "47900"; uv run watcher.py       # 改用其他 port
 
 ### Pane 偵測與分類（`classify()`）
 
-`wezterm cli list --format json` 列出全部 pane（**不像 tmux 有 `pane_current_command` 可 pre-filter**——WezTerm JSON 只給 `pane_id` / `window_id` / `tab_id` / `workspace` / `title` / `cwd`，沒有可信賴的「是否在跑 claude」欄位）。對每個 pane 跑 `wezterm cli get-text` 抓畫面，靠 `classify()` 視覺指紋判定四類，只有 `input` 與 `menu` 會送 codex：
+`wezterm cli list --format json` 列出全部 pane（**不像 tmux 有 `pane_current_command` 可 pre-filter**——WezTerm JSON 只給 `pane_id` / `window_id` / `tab_id` / `workspace` / `title` / `cwd`，沒有可信賴的「是否在跑 claude」欄位）。對每個 pane 跑 `wezterm cli get-text` 抓畫面，靠 `classify()` 視覺指紋判定三類，只有 `input` 與 `menu` 會送 codex：
 
 - `working`：title 首字是 Braille spinner（U+2800–U+28FF），**或**畫面**最後 5 行**含 `esc to interrupt` / `(ctrl+o to expand)`。只看尾段是刻意的——`(ctrl+o to expand)` 在折疊的 tool-output（`+N lines (ctrl+o to expand)`）也會出現，掃到 scrollback 就會誤判 working。
-- `drafting`：底部 ~15 行有以**全形 `｜`（U+FF5C）**開頭的行 → 使用者已 queued 草稿，不能介入。注意是全形 U+FF5C，不是半形 `|`（U+007C，statusline 也會用）。
 - `menu`：尾段有 `❯ 1.` / `❯ 2.` 編號選單（`MENU_CHOICE_RE`）。
 - `input`：尾段呈現「水平線 + `❯ ` 空輸入 + 水平線」的輸入框。
   - 水平線判定用 `line.count("─") >= 50`（`is_hr_line`）而非整行全 `─` 的 regex——頂部水平線會嵌入 session 標籤 `─── claude-codex-auto-responder ──`。

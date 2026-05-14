@@ -36,48 +36,46 @@ LOG_DIR = WATCHER_DIR / "logs"
 TRIGGER_DIR = LOG_DIR / "triggers"
 
 PROMPT_TEMPLATE = """\
-You are an auto-response decision agent for a Claude Code terminal session.
-Below is the current screen capture of a Claude Code pane that has been idle
-(waiting for user input) for several seconds.
+你是一個自動回應決策代理人，負責處理 Claude Code 終端 session。
+以下是某個 Claude Code pane 的當前畫面擷取，該 pane 已閒置數秒
+（等待使用者輸入）。
 
-Decide ONE action and reply with JSON matching the provided schema. The
-`value` field is required in every response — use null when it does not apply:
-  - action="text"   value=<reply text>            → type free-text reply, press Enter
-  - action="key"    value="1" | "2" | ...         → press a single digit for a menu choice
-  - action="enter"  value=null                    → press Enter only (accept default)
-  - action="skip"   value=<short reason>          → refuse to respond (ambiguous/dangerous)
+請決定一個動作，並以符合所附 schema 的 JSON 回覆。`value` 欄位
+在每個回應中都是必填的——不適用時填 null：
+  - action="text"   value=<回覆文字>            → 輸入自由文字回覆，按下 Enter
+  - action="key"    value="1" | "2" | ...       → 按下單一數字以選擇選單項
+  - action="enter"  value=null                  → 僅按下 Enter（接受預設值）
+  - action="skip"   value=<簡短原因>            → 拒絕回應（模糊／危險）
 
-PREFER MAKING A DECISION OVER SKIPPING. You have NO context beyond the screen
-below; do not invent details, but do use what is visible.
+**優先做出決策，而非 skip。** 你除了下方畫面外沒有任何額外上下文；
+不要憑空編造細節，但要善用畫面上可見的資訊。
 
-Decision rules:
-  - If the screen shows numbered options (e.g. "1. ... 2. ..."), PICK ONE.
-    When the choice is between an elevated-permission path (sudo, root, system
-    package install, modifying global state) and a software-only fallback that
-    achieves the same goal, prefer the fallback unless the screen explicitly
-    states the elevated path is required or preferred.
-  - When the same affirmative action is offered as both a one-time approval
-    ("Yes", "Yes, proceed") and a permanent approval ("Yes, and don't ask
-    again", "Always allow"), ALWAYS prefer the one-time option. Permanent
-    approvals remove future checkpoints and are hard to reverse.
-  - For a `❯` free-text input box, prefer action="text" with a concise reply
-    that answers the visible question. If the latest question is a clear yes/no
-    or one-word check, answer it directly.
-  - For an `❯ 1.` style menu line, prefer action="key" with the matching digit.
-  - Plan Mode confirmation (Claude proposes a multi-step plan and asks to
-    proceed): if the visible plan content looks complete and reasonable,
-    approve it. If the plan box appears truncated at the top (you can see a
-    closing `╰` border without a matching `╭` opener), pick the "No, keep
-    planning" option instead of approving blindly.
+決策規則：
+  - 若畫面顯示編號選項（例如 "1. ... 2. ..."），**選一個**。
+    當選項是「需提權的路徑」（sudo、root、系統套件安裝、修改全域狀態）
+    與「純軟體 fallback 但能達成相同目標」二擇一時，優先選 fallback，
+    除非畫面明確表示提權路徑是必要的或被推薦的。
+  - 當同一個肯定動作同時提供「一次性核准」（"Yes"、"Yes, proceed"）
+    與「永久核准」（"Yes, and don't ask again"、"Always allow"）兩個
+    選項時，**永遠優先選一次性**。永久核准會移除未來的檢查點，
+    且難以反悔。
+  - 看到 `❯` 自由文字輸入框時，優先用 action="text" 回覆精簡內容，
+    直接回答畫面上可見的問題。若最後的問題是明確的 yes/no 或單詞
+    確認，直接回答它。
+  - 看到 `❯ 1.` 樣式的選單行時，優先用 action="key" 配對對應的數字。
+  - Plan Mode 確認（Claude 提出多步驟計畫並請求繼續）：若可見的計畫
+    內容看起來完整且合理，核准它。若計畫框看起來在頂端被截斷
+    （你看得到收尾的 `╰` 邊框，卻看不到對應的 `╭` 起頭），
+    請選「No, keep planning」而非盲目核准。
 
-Skip ONLY when one of these holds:
-  1. The prompt asks for information you cannot possibly infer from the screen
-     (passwords, API keys, secrets, personal data).
-  2. Acting wrong would lose work irreversibly (rm -rf, force-push, DROP TABLE,
-     git reset --hard on dirty tree, deleting branches with unmerged commits).
-  3. No actual question or menu is visible — the pane is just idle.
+**僅在以下情況才 skip：**
+  1. 提示詞要求的資訊你不可能從畫面推得（密碼、API key、機密、
+     個人資料）。
+  2. 做錯會不可逆地遺失工作（rm -rf、force-push、DROP TABLE、
+     在 dirty tree 上 git reset --hard、刪除有未合併 commit 的分支）。
+  3. 畫面上根本沒有實際的問題或選單——pane 只是閒置。
 
---- SCREEN CAPTURE (between fences) ---
+--- 畫面擷取（介於圍欄之間） ---
 ```
 {screen}
 ```
@@ -97,8 +95,9 @@ DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
     "do you", "would you", "shall i", "should i",
     "continue", "confirm", "proceed", "approve",
     "press", "choose", "select", "pick",
-    "y/n", "yes/no", "(y/n)",
+    "y/n", "yes/no", "(y/n)", "yes", "Yes"
     "是否", "要不要", "請選", "請輸入", "請問", "確認",
+    "下一步", "要嗎", "要嘛",
 )
 NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
 
@@ -129,8 +128,10 @@ def is_empty_prompt_line(line: str) -> bool:
 WORKING_HINTS = ("esc to interrupt", "(ctrl+o to expand)")
 
 # Claude Code shows queued draft messages below the input box prefixed with
-# fullwidth `｜` (U+FF5C). When present the user has already typed their next
-# reply — auto-responder should leave the pane alone.
+# fullwidth `｜` (U+FF5C). They are stripped from the codex prompt by
+# `_strip_input_box_tail` so codex decides off the visible question/menu only;
+# classify() no longer short-circuits on them — earlier behaviour suppressed
+# real menu / input prompts when drafts were also visible.
 QUEUE_MARKER = "｜"
 
 # ---------- chrome filter for codex prompt ------------------------------------
@@ -606,6 +607,46 @@ def is_capture_truncated(screen: str) -> bool:
     return True
 
 
+def _strip_input_box_tail(text: str) -> str:
+    """Drop the trailing empty input box and any queued drafts. Codex only
+    needs the conversation tail (Claude's last question/output) to decide;
+    the empty `❯` prompt and `｜`-prefixed queued drafts are noise.
+
+    Conservative pattern (bottom-up):
+      1. drop trailing blank lines and `｜` queued-draft lines
+      2. if bottom is HR, peek up: tentatively eat HR-bottom, then any
+         interior of only-blank-or-empty-prompt lines, then expect HR-top
+      3. only strip the whole box when both HRs found AND interior had no
+         substantive content (so menu boxes with `❯ 1.` survive intact)
+    """
+    lines = text.splitlines()
+    n = len(lines)
+
+    i = n - 1
+    while i >= 0:
+        s = lines[i].strip()
+        if not s or s.startswith(QUEUE_MARKER):
+            i -= 1
+            continue
+        break
+
+    if i < 0:
+        return ""
+
+    if is_hr_line(lines[i]):
+        j = i - 1
+        while j >= 0:
+            s = lines[j].strip()
+            if not s or is_empty_prompt_line(lines[j]):
+                j -= 1
+                continue
+            break
+        if j >= 0 and is_hr_line(lines[j]):
+            return "\n".join(lines[:j]).rstrip("\n")
+
+    return "\n".join(lines[: i + 1]).rstrip("\n")
+
+
 def _trim_to_current_decision(screen: str, fallback_lines: int) -> str:
     """Reduce the screen to only the current decision's context before it
     is sent to codex. Two cases:
@@ -700,29 +741,9 @@ def _has_empty_input_box(screen: str) -> bool:
     return False
 
 
-def has_queued_input(screen: str) -> bool:
-    """User has typed a draft into the input box (Claude Code displays it
-    below the box prefixed with `｜`). Auto-responder must not intervene.
-
-    Custom statuslines (`📂` anchor) can also render lines starting with `｜`
-    (e.g. multi-line stderr previews), which would falsely look like queued
-    drafts. Queued drafts always appear *above* the statusline, so restrict
-    the search window to lines preceding the first `📂` row in the tail.
-    """
-    lines = screen.splitlines()[-15:]
-    statusline_start = next((i for i, l in enumerate(lines) if "📂" in l), len(lines))
-    candidates = [l for l in lines[:statusline_start] if l.strip()]
-    for l in candidates:
-        if l.lstrip().startswith(QUEUE_MARKER):
-            return True
-    return False
-
-
 def classify(screen: str, title: str) -> str:
     if is_working(screen, title):
         return "working"
-    if has_queued_input(screen):
-        return "drafting"
     tail_lines = screen.splitlines()[-30:]
     if any(MENU_CHOICE_RE.match(l) for l in tail_lines):
         return "menu"
@@ -796,7 +817,8 @@ def build_prompt(screen: str, cfg: dict[str, Any]) -> str:
     cleaned = _clean_screen(screen)
     fallback = int(cfg.get("prompt_context_lines", 60))
     trimmed = _trim_to_current_decision(cleaned, fallback)
-    return PROMPT_TEMPLATE.format(screen=trimmed)
+    stripped = _strip_input_box_tail(trimmed)
+    return PROMPT_TEMPLATE.format(screen=stripped)
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
@@ -920,7 +942,10 @@ async def apply_action(
         # accidentally firing extra Enters mid-text — terminal control chars
         # in arbitrary LLM output are a footgun.
         sanitized = value.replace("\r", "").replace("\n", " ")
-        wezterm_send_text(pane.pane_id, sanitized + "\r")
+        # Trail with `\r\n`: `\r` fires submit; `\n` is a defensive trailer in
+        # case the TUI's paste-burst heuristic swallows the lone `\r`. `\n`
+        # alone on already-submitted (empty) buffer is a no-op.
+        wezterm_send_text(pane.pane_id, sanitized + "\r\n")
         return f"text:{len(sanitized)}chars"
     return f"unknown-action:{action!r}"
 
@@ -1163,7 +1188,7 @@ async def handle_milestone_event(
     if not screen:
         return
     cls = classify(screen, pane.title)
-    if cls in ("working", "drafting"):
+    if cls == "working":
         log.info("milestone-toggle: pane %d busy (class=%s); skipping inject", pane_id, cls)
         return
     if not _milestone_rate_limit_ok(entry, cfg):
