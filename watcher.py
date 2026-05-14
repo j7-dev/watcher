@@ -207,7 +207,11 @@ _WELCOME_MARKERS = ("Welcome back", "Tips for getting started", "/release-notes 
 _STATUSLINE_RE = re.compile(r"📂")               # status line: model badge/dir/branch (📂 is unique anchor)
 _FOOTER_RE     = re.compile(r"^\s*⏵⏵\s+(bypass|auto-accept)")  # bottom mode hint
 _BAKED_RE      = re.compile(r"^\s*\S\s+\S.*?(?:[…\.]+\s*\(\d|\s+for\s+\d+\s*[ms])")  # spinner status: "✻ Sautéed for 6m 53s" / "✶ Nebulizing… (24m 54s · ...)" / "✻ Scaffolding monorepo root… (1h 2m 44s · ...)"
-_TOKEN_RE      = re.compile(r"^\s*\d+\s+tokens\s*$")            # `114738 tokens` line
+_TOKEN_RE      = re.compile(                                    # token counter / `/clear` hint line (right-aligned status)
+    r"^\s*"
+    r"(?:new task\?\s+/clear to save\s+)?"   # optional contextual hint prefix
+    r"\d+(?:\.\d+)?[kKmM]?\s+tokens\s*$"     # `114738 tokens`, `225.3k tokens`, `1.2M tokens`
+)
 _RECAP_RE      = re.compile(r"^\s*※\s*recap", re.IGNORECASE)    # Claude self-injected `※ recap: ...` summary block
 
 
