@@ -48,7 +48,28 @@ action。
    消歧義（例如理解使用者意圖），與畫面衝突時以畫面為準，不可蓋過畫面。
 3. **行動代價不對稱**：錯 `skip` 讓使用者下輪自處理（小代價）；錯
    `text`/`key` 可能觸發不可逆操作（大代價）。模糊時偏 skip，
-   **但畫面明顯有等待答案的問題時，請優先給答案而非 skip。**
+   **但畫面明顯有等待答案的問題、或 Claude 陳述了下一步打算做什麼時，
+   請優先主動回覆（給答案或推進）而非 skip。**
+
+═══ 自動推進原則（narrative / 陳述句也要動作） ═══
+Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列舉文件、宣告
+下一步計畫（"下一步建議：..."、"接下來會..."、"完整文件：..."）。
+**這類陳述句 user 通常期望 daemon 主動推進**，不要被動 `skip idle`。
+
+判斷流程：
+- 陳述句 + 暗示有下一步可做（"下一步...", "接下來...", "Week N 用..."）
+  → `text`，value=簡短中性推進語（如 "繼續"、"好"、"請開始"、"OK 開始"）。
+- 陳述句 + 只是工作報告 / 無明確下一步（純成果總結、文件清單、task tick list）
+  → `text`，value=「繼續」推 Claude 自行決定下一步。
+- **安全閘**：陳述句裡若提到不可逆關鍵字（刪除 / drop / rm / force / 砍掉 /
+  清空 / DROP TABLE / reset --hard / 強推），改 `skip` value=`dangerous-narrative`。
+- 真正純閒置（畫面空、無內容、無 Claude 輸出）→ `skip` value=`idle`。
+
+推進語規則：
+- **中性**：不假設細節（不指定 file 名 / 數字 / 路徑），只說「繼續」「好」。
+- **短**：≤ 6 字最佳，最多 12 字。
+- **語言匹配**：畫面中文 → 中文推進語；畫面英文 → 英文（"continue" / "go"）。
+- **絕對不可用 text 在已填 `❯ <已有文字>` 場景**——那會 append 串成亂碼。
 
 ═══ 符號圖例（畫面已預處理，請依此語意解讀） ═══
 - `> <文字>`   → conversation 內**已 submit 的歷史 user 訊息**（不可變、僅供脈絡，
@@ -71,13 +92,13 @@ action。
 - **When**：狀態新鮮嗎？畫面無 `❯` 結尾（空 input box，新鮮）vs `❯ <已有文字>`
   （可能上輪自動化已 type 但 Enter 未送的 stale state）。
 - **Where**：游標 `❯` 落在哪一行？編號選項上、還是 input box 草稿上？
-- **Why**：往上掃畫面，提示在問什麼？權限／確認／計畫核准／自由回答？
-  **區分**：Claude **自宣告下一步**（"下一步建議：..."、"接下來會..."、
-  "下一步是..."、"我會繼續..." → 陳述句，**不需 user 動作**，判
-  `skip` value=`idle`）vs **徵詢核准**（"要繼續嗎？"、"是否進行？"、
-  "Y/n?"、"Press 1..."、"請選擇..." → 真問句，判 `enter` / `key` /
-  `text`）。陳述句中含 `?` 的（如內文編號列表 `1. ...?`）也算自宣告，
-  不視為徵詢。
+- **Why**：往上掃畫面，提示在問什麼或在告知什麼？三類：
+    a) **徵詢核准**（"要繼續嗎？"、"是否進行？"、"Y/n?"、"Press 1..."、
+       "請選擇..."）→ 真問句，判 `enter` / `key` / `text` 給答案。
+    b) **自宣告下一步 / 工作陳述**（"下一步建議：..."、"接下來會..."、
+       "完整文件：..."、task tick list、輸出總結）→ 陳述句，依「自動
+       推進原則」判 `text` 主動推進（短中性推進語）。
+    c) **純閒置**（畫面空、無 Claude 內容）→ `skip` value=`idle`。
 - **How**：對照下方決策表選 action。
 
 ═══ Action schema（value 必填，不適用填 null） ═══
@@ -96,7 +117,10 @@ action。
 - `❯ 1.` 編號選單：
     - 游標 `❯` 已在你要選的項上 → `enter`（最不易誤觸）。
     - 要切非游標項 → `key` value="<該數字>"。
-- 純訊息／純閒置 → `skip` value=`idle` 或具體原因。
+- 純訊息 / Claude narrative / 陳述下一步 → 依「自動推進原則」判 `text`，
+  value=中性推進語（"繼續" / "好" / "OK" / "continue"）。
+- 純閒置（畫面真的沒內容） → `skip` value=`idle`。
+- 含不可逆關鍵字的 narrative → `skip` value=`dangerous-narrative`。
 
 ═══ 安全閘（任一命中 → skip） ═══
 1. 提示要求畫面拿不到的機密（密碼／API key／個資）。
@@ -239,42 +263,20 @@ def predict_skip(
     markers: list[str],
 ) -> str | None:
     """Return a reason string when we predict codex would answer `skip`,
-    otherwise None. Only fires for `input` classification — `menu` screens
-    always carry numbered choices so they are answerable.
-
-    Per-line marker check: bare numbered list lines (`1. text` / `1) text`
-    with NO `❯` prefix) are conversation-content enumeration, not interactive
-    menus — classifier already ruled out menu when classification == "input"
-    (real menus carry `❯ \\d.` cursor at the tail). A `?` inside such a line
-    is therefore a rhetorical content question, not a live prompt. Skipping
-    marker check on those lines avoids forcing a codex round-trip every time
-    Claude lists numbered open-questions in its narration.
-    """
+    otherwise None. Conservative by design: only short-circuits when the
+    cleaned screen is literally empty — every other case (questions, menus,
+    narrative chunks, idle-looking task lists) is passed to codex so it can
+    decide for itself whether to skip, push the conversation forward with a
+    short reply, or pick a menu option. `markers` / `lookback` are kept in
+    the signature for backward compat (config-driven) but no longer drive
+    the decision."""
+    del lookback, markers  # kept for signature compat; behaviour now codex-driven
     if classification != "input":
         return None
     nonempty = [l for l in clean_screen.splitlines() if l.strip()]
     if not nonempty:
         return "empty cleaned screen"
-    window = nonempty[-max(lookback, 1):]
-    for line in window:
-        stripped = line.lstrip()
-        # Skip non-question lines: bare numbered content (rhetorical `?` in
-        # internal lists), queued user-drafts (`｜` prefix — user's typing,
-        # not Claude's question), input-box cursor / draft / menu cursor
-        # (`❯` — handled by classifier, the cursor symbol itself isn't a
-        # question), and horizontal rules.
-        if NUMBERED_LIST_RE.match(line):
-            continue
-        if stripped.startswith(QUEUE_MARKER):
-            continue
-        if stripped.startswith("❯"):
-            continue
-        if is_hr_line(line):
-            continue
-        line_lc = line.lower()
-        if any(m in line_lc for m in markers):
-            return None
-    return f"no live question marker in last {len(window)} non-empty line(s)"
+    return None
 
 
 def _screen_hash(clean_screen: str, context: str = "") -> str:
