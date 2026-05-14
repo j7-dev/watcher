@@ -55,7 +55,7 @@ prompt_context_lines            = 60
 hr_min_length                   = 50     # 偵測水平線時的最小 `─` 字元數
 
 # ---- 日誌 ------------------------------------------------------------------
-log_enabled                = false                            # 整體 log 開關。預設 false (畫面快照可能含 token，預設不落地)。改 true 才會寫 watcher.log 與 triggers/*.json
+log_enabled                = true                            # 整體 log 開關。預設 false (畫面快照可能含 token，預設不落地)。改 true 才會寫 watcher.log 與 triggers/*.json
 log_format                 = "%(asctime)s %(levelname)s %(message)s"  # Python logging 格式字串
 log_datefmt                = "%Y-%m-%d %H:%M:%S"             # asctime 的時間格式
 log_max_bytes              = 10_000_000                       # 單一 watcher.log 大小上限 (byte)，超過自動 rotate

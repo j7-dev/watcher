@@ -2,8 +2,9 @@
 Codex CLI what to reply, then send keys back via `wezterm cli send-text`.
 
 Run: `uv run watcher.py`  (or `uv run watcher`)
-     `uv run watcher.py --once`     → single discovery/classification tick, no codex
-     `uv run watcher.py --dry-run`  → full loop but skip the final send-text
+     `uv run watcher.py --once`     → single tick: classify + invoke codex for every input/menu pane, then exit
+     `uv run watcher.py --once --dry-run` → same as --once but skip send-text
+     `uv run watcher.py --dry-run`  → full daemon loop but skip the final send-text
 """
 
 from __future__ import annotations
@@ -304,6 +305,164 @@ def socket_info_path() -> Path:
     Stop-hook reads this to find a running daemon without hardcoding the port.
     """
     return Path.home() / ".watcher" / "socket-info.json"
+
+
+# ---------- singleton enforcement ---------------------------------------------
+#
+# Two-layer guard prevents a second `uv run watcher.py` (foreground OR
+# daemon-launched) from racing the first one:
+#
+#   1. File lock on ~/.watcher/watcher.lock — OS-level mandatory mutex
+#      (msvcrt.locking LK_NBLCK on Windows, fcntl.flock LOCK_EX|LOCK_NB on
+#      POSIX). Released automatically when the process exits, including
+#      crashes — no stale-lock recovery problem.
+#   2. PID + started_at + exe path verification against socket-info.json —
+#      defense-in-depth catching the (rare) case where the kernel released
+#      the lock but the old process is still alive. Also produces a useful
+#      diagnostic message pointing at the offending PID.
+
+_LOCK_FD: int | None = None  # keep alive for the lifetime of this process
+
+
+def watcher_lock_path() -> Path:
+    return Path.home() / ".watcher" / "watcher.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_exe(pid: int) -> str | None:
+    """Best-effort: return the executable path of pid, or None on failure.
+    Used for PID-reuse defence — if PID is reused by a non-watcher process,
+    we want to overwrite the stale socket-info, not refuse to start."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not h:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                h, 0, buf, ctypes.byref(size)
+            )
+            return buf.value if ok else None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def _read_singleton_info() -> dict[str, Any]:
+    info_path = socket_info_path()
+    if not info_path.exists():
+        return {}
+    try:
+        return json.loads(info_path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _is_watcher_pid(pid: int) -> bool:
+    """Check pid is alive AND its executable looks like a python interpreter.
+    Conservative: on lookup failure, return True (treat as same-watcher) so we
+    err on the side of refusing — a missed kill is recoverable, a duplicate
+    daemon causing send-text races is not."""
+    if not _pid_alive(pid):
+        return False
+    exe = _pid_exe(pid)
+    if exe is None:
+        return True  # can't tell → assume same watcher, refuse to start
+    return "python" in exe.lower() or "pythonw" in exe.lower()
+
+
+def acquire_singleton_lock() -> None:
+    """Acquire process-wide exclusive lock or exit(2). Must be called BEFORE
+    starting the socket server / poll loop. Lock is held for the lifetime of
+    this process via the module-global fd; the OS releases it on exit."""
+    global _LOCK_FD
+    lock_path = watcher_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        info = _read_singleton_info()
+        pid = int(info.get("pid", 0) or 0)
+        started = str(info.get("started_at", "") or "")
+        alive = _pid_alive(pid) if pid else False
+        msg = (
+            "watcher already running"
+            + (f" (pid={pid}" if pid else "")
+            + (f", started_at={started}" if started else "")
+            + (f", alive={alive}" if pid else "")
+            + (")" if pid else "")
+            + f". Refusing to start a second instance. Lock: {lock_path}\n"
+        )
+        sys.stderr.write(msg)
+        sys.exit(2)
+
+    # Defense in depth: lock acquired but socket-info points at a still-alive
+    # python process from a previous incarnation (kernel released the lock
+    # without that process exiting — should not happen, but if it does, the
+    # old one will fight us over send-text). Verify and refuse.
+    info = _read_singleton_info()
+    pid = int(info.get("pid", 0) or 0)
+    if pid and pid != os.getpid() and _is_watcher_pid(pid):
+        started = str(info.get("started_at", "") or "")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        sys.stderr.write(
+            f"watcher already running per socket-info (pid={pid}"
+            + (f", started_at={started}" if started else "")
+            + "). Refusing to start a second instance.\n"
+        )
+        sys.exit(2)
+
+    _LOCK_FD = fd  # keep fd open for process lifetime; OS releases on exit
 
 
 def _coerce(default: Any, raw: str) -> Any:
@@ -1403,6 +1562,7 @@ async def main_loop(
 
 
 async def run_daemon(cfg: dict[str, Any], dry_run: bool) -> None:
+    acquire_singleton_lock()
     states: dict[int, PaneState] = {}
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1435,17 +1595,36 @@ async def run_daemon(cfg: dict[str, Any], dry_run: bool) -> None:
         log.info("watcher exiting")
 
 
-async def run_once(cfg: dict[str, Any]) -> int:
-    """Single-tick diagnostic: print discovered panes + classification, no codex."""
+async def run_once(cfg: dict[str, Any], dry_run: bool = False) -> int:
+    """Single-tick test mode: discover, classify, print — then synchronously
+    drive `handle_pane` for every `input`/`menu` pane so codex is actually
+    invoked (with full audit log + cache + predictor short-circuits).
+
+    Bypasses `should_trigger` killswitch/cooldown because fresh `PaneState`
+    instances are used per invocation — there is no per-pane history to gate
+    against. Honors `--dry-run` (no send-text)."""
     panes = discover_panes(os.getpid())
     if not panes:
         print("no wezterm panes found (is WezTerm GUI running?)")
         return 0
+    triggerable: list[tuple[Pane, str, str]] = []
     for p in panes:
         screen = capture_pane_adaptive(p.pane_id, cfg)
         cls = classify(screen)
         print(f"pane={p.pane_id:<4} window={p.window_id} tab={p.tab_id} "
               f"class={cls:<8} title={p.title!r}")
+        if cls in ("input", "menu") and screen:
+            triggerable.append((p, cls, screen))
+    if not triggerable:
+        print("no input/menu panes — nothing to send to codex")
+        return 0
+    print(f"triggering codex for {len(triggerable)} pane(s) "
+          f"(dry_run={dry_run}) ...")
+    for pane, cls, screen in triggerable:
+        state = PaneState()
+        state.last_classification = cls
+        state.in_flight = True
+        await handle_pane(pane, state, screen, cfg, dry_run)
     return 0
 
 
@@ -1453,13 +1632,13 @@ async def run_once(cfg: dict[str, Any]) -> int:
 
 def cli_entry() -> None:
     ap = argparse.ArgumentParser(description="Auto-respond to Claude prompts via Codex CLI.")
-    ap.add_argument("--once", action="store_true", help="single tick, print discovery, no codex call")
+    ap.add_argument("--once", action="store_true", help="single tick: classify + invoke codex for every input/menu pane, then exit (combine with --dry-run to skip send-text)")
     ap.add_argument("--dry-run", action="store_true", help="full loop but skip send-keys")
     args = ap.parse_args()
     cfg = load_config()
     setup_logging(cfg)
     if args.once:
-        sys.exit(asyncio.run(run_once(cfg)))
+        sys.exit(asyncio.run(run_once(cfg, dry_run=args.dry_run)))
     try:
         asyncio.run(run_daemon(cfg, dry_run=args.dry_run))
     except KeyboardInterrupt:

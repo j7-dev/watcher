@@ -16,8 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```powershell
 uv sync                          # 安裝依賴（首次或更新後）
 uv run watcher.py                # 正式跑 daemon
-uv run watcher.py --once         # 單次偵測 + 分類列印，不呼叫 codex
-uv run watcher.py --dry-run      # 完整迴圈呼叫 codex，但不 send-text
+uv run watcher.py --once         # 單次偵測：分類列印 + 對每個 input/menu pane 同步打 codex 一次後退出（測試用）
+uv run watcher.py --once --dry-run  # 同上但不 send-text
+uv run watcher.py --dry-run      # 完整 daemon 迴圈呼叫 codex，但不 send-text
 uv run watcher                   # 等同於上面（pyproject 已定義 entry point）
 
 # daemon 控制（會起一個 WezTerm window/pane 跑 watcher）
