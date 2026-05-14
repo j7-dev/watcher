@@ -373,6 +373,14 @@ DEFAULTS: dict[str, Any] = {
     "milestone_command_text": "/milestone-runner",
     "milestone_max_reinjects_per_window": 5,
     "milestone_reinject_cooldown_seconds": 5,
+    # Rate-limit handling: detect "You've hit your limit" prompt, press Enter
+    # to accept the highlighted "Stop and wait" option, then schedule a delayed
+    # resume that types `rate_limit_resume_text` after the reset time passes.
+    "rate_limit_detection_enabled": True,
+    "rate_limit_resume_text": "繼續",
+    "rate_limit_resume_buffer_seconds": 60,
+    "rate_limit_max_wait_hours": 26,
+    "rate_limit_tz_fallback": "Asia/Taipei",
 }
 
 
@@ -633,6 +641,14 @@ class PaneState:
     # event ever received) leave this None and run with screen-only prompts.
     # Daemon restart loses this — re-populated on the next Stop hook.
     transcript_path: str | None = None
+    # Active rate-limit resume task. When the pane shows "You've hit your
+    # limit · resets <time>", the detector parses the reset time, Enter-confirms
+    # the highlighted "Stop and wait" option, and schedules a task to send the
+    # resume text (config: rate_limit_resume_text) once the reset time passes.
+    # `rate_limit_resume_at` is the epoch the task will fire at — used to
+    # dedupe re-detections of the same limit screen.
+    rate_limit_task: asyncio.Task[None] | None = None
+    rate_limit_resume_at: float = 0.0
 
 
 # ---------- wezterm helpers ----------------------------------------------------
@@ -1408,6 +1424,270 @@ def audit(
     fn.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ---------- rate-limit detection & resume scheduling ---------------------------
+#
+# Claude Code shows a rate-limit prompt like
+#
+#     You've hit your limit · resets May 16, 1am (Asia/Taipei)
+#
+#     ❯ 1. Stop and wait
+#       2. Switch model
+#       3. ...
+#
+# The detector recognizes the limit phrase + numbered menu, presses Enter to
+# accept the highlighted default ("Stop and wait" — option 1), and schedules a
+# one-shot asyncio task that re-captures the pane after the reset time + a
+# safety buffer and sends `rate_limit_resume_text` (default "繼續") so the
+# session picks back up automatically.
+#
+# Rate-limit handling bypasses the codex round-trip entirely (deterministic
+# signal) and does NOT count toward the per-pane killswitch — being throttled
+# is a system response, not a codex action.
+
+RATE_LIMIT_PHRASE_RE = re.compile(r"You['’]ve hit your limit", re.IGNORECASE)
+
+# Reset clause variants we recognize. Ordered specific → general; first match
+# wins. tz capture is optional — falls back to `rate_limit_tz_fallback`.
+_RESET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "May 16, 1am" / "May 16 1:30pm" / "Sep 3, 11 pm"
+    re.compile(
+        r"resets\s+(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})[,\s]+"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+        r"(?:\s*\((?P<tz>[\w/_+\-]+)\))?",
+        re.IGNORECASE,
+    ),
+    # "Tomorrow at 1am" / "tomorrow 1:30am"
+    re.compile(
+        r"resets\s+tomorrow(?:\s+at)?\s+"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+        r"(?:\s*\((?P<tz>[\w/_+\-]+)\))?",
+        re.IGNORECASE,
+    ),
+    # "at 1am" / "1pm" (bare time — assume today; if past, roll to tomorrow)
+    re.compile(
+        r"resets\s+(?:at\s+)?"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+        r"(?:\s*\((?P<tz>[\w/_+\-]+)\))?",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _resolve_tz(name: str) -> Any:
+    """Return a zoneinfo.ZoneInfo for `name`, or local tzinfo on failure.
+    Imported lazily so a missing tzdata package on Windows can't break import."""
+    if not name:
+        return dt.datetime.now().astimezone().tzinfo
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except Exception:
+        return dt.datetime.now().astimezone().tzinfo
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return dt.datetime.now().astimezone().tzinfo
+
+
+def _ampm_to_24h(hour: int, ampm: str) -> int:
+    a = ampm.lower()
+    if a == "am":
+        return 0 if hour == 12 else hour
+    return 12 if hour == 12 else hour + 12
+
+
+_MONTH_ABBR_TO_NUM: dict[str, int] = {
+    m.lower(): i for i, m in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1
+    )
+}
+
+
+def _parse_reset_time(screen: str, tz_fallback: str) -> float | None:
+    """Parse the `resets …` clause from the screen and return an absolute
+    epoch (seconds), or None if no recognized clause / parse failure."""
+    fallback_tz = _resolve_tz(tz_fallback)
+    if fallback_tz is None:
+        return None
+    now = dt.datetime.now(tz=fallback_tz)
+    for idx, pat in enumerate(_RESET_PATTERNS):
+        m = pat.search(screen)
+        if not m:
+            continue
+        g = m.groupdict()
+        tz = _resolve_tz(g.get("tz") or tz_fallback) or fallback_tz
+        try:
+            hour = _ampm_to_24h(int(g["hour"]), g["ampm"])
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= hour <= 23):
+            continue
+        minute = int(g.get("minute") or 0)
+        if not (0 <= minute <= 59):
+            continue
+        try:
+            if idx == 0:  # explicit "<Month> <Day>"
+                month_key = g["month"][:3].lower()
+                month_num = _MONTH_ABBR_TO_NUM.get(month_key)
+                if month_num is None:
+                    continue
+                day = int(g["day"])
+                # Try current year first; if result is in the past, try +1y.
+                for delta_year in (0, 1):
+                    try:
+                        candidate = dt.datetime(
+                            now.year + delta_year, month_num, day,
+                            hour, minute, tzinfo=tz,
+                        )
+                    except ValueError:
+                        candidate = None
+                    if candidate is not None and candidate > now:
+                        return candidate.timestamp()
+                continue
+            if idx == 1:  # "tomorrow"
+                d = (now + dt.timedelta(days=1)).date()
+                return dt.datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz).timestamp()
+            # bare time
+            d = now.date()
+            candidate = dt.datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz)
+            if candidate <= now:
+                candidate += dt.timedelta(days=1)
+            return candidate.timestamp()
+        except Exception:
+            log.exception("_parse_reset_time: unexpected error on pattern %d", idx)
+            continue
+    return None
+
+
+def detect_rate_limit(screen: str, cfg: dict[str, Any]) -> float | None:
+    """Return the reset epoch when `screen` shows a Claude Code rate-limit
+    prompt with a parseable reset time AND a numbered menu in the tail.
+    Returns None otherwise (caller falls through to the regular codex path).
+    """
+    if not bool(cfg.get("rate_limit_detection_enabled", True)):
+        return None
+    if not RATE_LIMIT_PHRASE_RE.search(screen):
+        return None
+    # Enter only makes sense if a numbered menu cursor is visible — without
+    # the `❯ N.` highlight, Enter would submit an empty input box instead.
+    tail_lines = screen.splitlines()[-30:]
+    if not any(MENU_CHOICE_RE.match(l) for l in tail_lines):
+        return None
+    epoch = _parse_reset_time(screen, str(cfg.get("rate_limit_tz_fallback", "Asia/Taipei")))
+    if epoch is None:
+        return None
+    now = time.time()
+    max_wait_s = float(cfg.get("rate_limit_max_wait_hours", 26)) * 3600.0
+    if epoch - now > max_wait_s:
+        log.warning("rate-limit reset %.0f is %.1fh away (cap %.1fh); not scheduling",
+                    epoch, (epoch - now) / 3600.0, max_wait_s / 3600.0)
+        return None
+    if epoch - now < -300.0:
+        log.warning("rate-limit reset %.0f is in the past (>5min); not scheduling", epoch)
+        return None
+    return epoch
+
+
+async def _resume_after_rate_limit(
+    pane: Pane,
+    state: PaneState,
+    reset_epoch: float,
+    cfg: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """Sleep until `reset_epoch` + buffer, then re-capture the pane and send
+    the resume text if it now looks ready (idle input box). If Claude TUI is
+    still on the limit screen (clock skew, slow rollover), retry in 30s.
+    If the pane has moved on to a different context, abort silently."""
+    try:
+        buffer_s = float(cfg.get("rate_limit_resume_buffer_seconds", 60))
+        delay = max(0.0, reset_epoch + buffer_s - time.time())
+        log.info(
+            "rate-limit resume scheduled pane=%d reset_epoch=%.0f wait=%.1fs",
+            pane.pane_id, reset_epoch, delay,
+        )
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            log.info("rate-limit resume cancelled pane=%d", pane.pane_id)
+            return
+        fresh = capture_pane_adaptive(pane.pane_id, cfg)
+        if not fresh:
+            log.warning("rate-limit resume: capture failed pane=%d", pane.pane_id)
+            return
+        if RATE_LIMIT_PHRASE_RE.search(fresh):
+            log.info("rate-limit resume: pane=%d still rate-limited; retrying in 30s",
+                     pane.pane_id)
+            new_epoch = time.time() + 30.0 - buffer_s
+            state.rate_limit_resume_at = new_epoch
+            state.rate_limit_task = asyncio.create_task(
+                _resume_after_rate_limit(pane, state, new_epoch, cfg, dry_run)
+            )
+            return
+        cls = classify(fresh)
+        if cls == "working":
+            log.info("rate-limit resume: pane=%d is working; retrying in 30s", pane.pane_id)
+            new_epoch = time.time() + 30.0 - buffer_s
+            state.rate_limit_resume_at = new_epoch
+            state.rate_limit_task = asyncio.create_task(
+                _resume_after_rate_limit(pane, state, new_epoch, cfg, dry_run)
+            )
+            return
+        if cls != "input":
+            log.info("rate-limit resume: pane=%d now class=%s; aborting send",
+                     pane.pane_id, cls)
+            return
+        resume_text = str(cfg.get("rate_limit_resume_text", "繼續"))
+        if dry_run:
+            log.info("rate-limit resume DRY-RUN pane=%d would send text=%r",
+                     pane.pane_id, resume_text)
+            outcome = f"dry-run:text:{resume_text}"
+        else:
+            try:
+                outcome = await apply_action(
+                    pane, "text", resume_text,
+                    baseline=fresh,
+                    scrollback=int(cfg["capture_scrollback_lines"]),
+                )
+            except Exception as e:
+                log.exception("rate-limit resume apply_action failed pane=%d", pane.pane_id)
+                outcome = f"apply-error:{e}"
+        log.info("rate-limit resume sent pane=%d outcome=%s", pane.pane_id, outcome)
+        try:
+            audit(
+                pane, fresh,
+                {"action": "text", "value": resume_text,
+                 "source": "rate-limit-resume"},
+                f"rate-limit-resume:{outcome}", cfg,
+            )
+        except Exception:
+            log.exception("audit write failed (rate-limit resume)")
+    finally:
+        state.rate_limit_resume_at = 0.0
+        state.rate_limit_task = None
+
+
+def _schedule_rate_limit_resume(
+    pane: Pane,
+    state: PaneState,
+    reset_epoch: float,
+    cfg: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """(Re-)schedule the resume task. If one is already pending for roughly
+    the same epoch (±60s) keep it; otherwise cancel and create a fresh one
+    so repeated detections of the same limit screen don't stack tasks."""
+    existing = state.rate_limit_task
+    if existing is not None and not existing.done():
+        if abs(state.rate_limit_resume_at - reset_epoch) < 60.0:
+            return
+        existing.cancel()
+    state.rate_limit_resume_at = reset_epoch
+    state.rate_limit_task = asyncio.create_task(
+        _resume_after_rate_limit(pane, state, reset_epoch, cfg, dry_run)
+    )
+
+
 # ---------- per-pane handler ---------------------------------------------------
 
 async def handle_pane(
@@ -1420,6 +1700,44 @@ async def handle_pane(
     try:
         async with state.lock:
             log.info("trigger %s class=%s title=%r", pane.pane_id, state.last_classification, pane.title)
+
+            # Rate-limit short-circuit: highest priority, runs before any
+            # codex round-trip. Deterministic signal — when Claude Code shows
+            # "You've hit your limit · resets …" with a numbered menu, press
+            # Enter (accept the highlighted "Stop and wait" option) and
+            # schedule a delayed resume that types `rate_limit_resume_text`
+            # after the reset time passes. Does not append to
+            # responses_in_window — being throttled is a system response, not
+            # a codex action, and must not count toward the killswitch.
+            rl_epoch = detect_rate_limit(snapshot, cfg)
+            if rl_epoch is not None:
+                log.info("rate-limit detected pane=%d reset_epoch=%.0f",
+                         pane.pane_id, rl_epoch)
+                if dry_run:
+                    rl_outcome = "dry-run:enter"
+                else:
+                    try:
+                        rl_outcome = await apply_action(
+                            pane, "enter", None,
+                            baseline=snapshot,
+                            scrollback=int(cfg["capture_scrollback_lines"]),
+                        )
+                    except Exception as e:
+                        log.exception("rate-limit Enter apply_action failed pane=%d", pane.pane_id)
+                        rl_outcome = f"apply-error:{e}"
+                _schedule_rate_limit_resume(pane, state, rl_epoch, cfg, dry_run)
+                state.cooldown_until = time.time() + float(cfg["per_pane_cooldown_seconds"])
+                try:
+                    audit(
+                        pane, snapshot,
+                        {"action": "enter", "value": None,
+                         "source": "rate-limit-detect",
+                         "resume_epoch": rl_epoch},
+                        f"rate-limited:{rl_outcome}", cfg,
+                    )
+                except Exception:
+                    log.exception("audit write failed (rate-limit detect)")
+                return
 
             # Best-effort: enrich the codex prompt with Claude Code session
             # metadata (title + initial/current user request) when we have a
