@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -482,7 +483,13 @@ def discover_panes(_my_pid: int) -> list[Pane]:
     return panes
 
 
-_ANSI_CSI_RE = re.compile(r"\x1b\[([0-9;?]*)([a-zA-Z])")
+_ANSI_CSI_RE = re.compile(r"\x1b\[([0-9:;?]*)([a-zA-Z])")
+# OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \).
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+# DCS / SOS / PM / APC: ESC (P|X|^|_) ... ST.
+_ANSI_STR_RE = re.compile(r"\x1b[PX^_][^\x1b]*\x1b\\")
+# Charset designators: ESC ( B, ESC ) 0, etc. (G0..G3 select).
+_CHARSET_INTRO = "()*+-./"
 
 
 def _strip_ghost_text(raw: str) -> str:
@@ -493,6 +500,12 @@ def _strip_ghost_text(raw: str) -> str:
     from real input once SGR codes are stripped. Dropping these chars makes a
     ghosted `❯ <suggestion>` line collapse back to an empty prompt so
     `classify()` sees the true idle state.
+
+    Also strips non-CSI escapes: ISO-2022 charset designators (`ESC ( B`,
+    `ESC ) 0` etc), OSC strings (`ESC ] ... BEL`), DCS/SOS/PM/APC strings,
+    and single-byte Fe sequences. WezTerm emits `\\x1b(B` when switching
+    between ASCII and DEC line-drawing for box borders; leaving these in
+    the cleaned screen pollutes codex's view with `(B` litter.
 
     Side effect: a real cursor reverse-video block (almost always sitting on
     the trailing whitespace after typed input) also gets dropped — harmless
@@ -505,26 +518,46 @@ def _strip_ghost_text(raw: str) -> str:
     n = len(raw)
     while i < n:
         ch = raw[i]
-        if ch == "\x1b" and i + 1 < n and raw[i + 1] == "[":
-            m = _ANSI_CSI_RE.match(raw, i)
-            if m:
-                params, final = m.group(1), m.group(2)
-                if final == "m":
-                    parts = params.split(";") if params else ["0"]
-                    for p in parts:
-                        p = p or "0"
-                        if p == "0":
-                            dim = False
-                            reverse = False
-                        elif p == "2":
-                            dim = True
-                        elif p == "22":
-                            dim = False
-                        elif p == "7":
-                            reverse = True
-                        elif p == "27":
-                            reverse = False
-                i = m.end()
+        if ch == "\x1b" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == "[":
+                m = _ANSI_CSI_RE.match(raw, i)
+                if m:
+                    params, final = m.group(1), m.group(2)
+                    if final == "m":
+                        parts = params.split(";") if params else ["0"]
+                        for p in parts:
+                            p = p or "0"
+                            if p == "0":
+                                dim = False
+                                reverse = False
+                            elif p == "2":
+                                dim = True
+                            elif p == "22":
+                                dim = False
+                            elif p == "7":
+                                reverse = True
+                            elif p == "27":
+                                reverse = False
+                    i = m.end()
+                    continue
+            elif nxt == "]":
+                m = _ANSI_OSC_RE.match(raw, i)
+                if m:
+                    i = m.end()
+                    continue
+            elif nxt in "PX^_":
+                m = _ANSI_STR_RE.match(raw, i)
+                if m:
+                    i = m.end()
+                    continue
+            elif nxt in _CHARSET_INTRO and i + 2 < n:
+                i += 3  # ESC + intro + charset id
+                continue
+            else:
+                # Unrecognized 2-byte Fe sequence (ESC D, ESC E, ESC H,
+                # ESC M, ESC N, ESC O, ESC 7, ESC 8, ESC =, ESC >, ESC c…).
+                i += 2
                 continue
         if ch == "\x1b":
             i += 1
@@ -775,7 +808,7 @@ def _strip_fences(text: str) -> str:
     return m.group(1).strip() if m else s
 
 
-async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, Any]:
+async def call_codex(pane: Pane, full_prompt: str, cfg: dict[str, Any]) -> dict[str, Any]:
     ts = int(time.time())
     safe_id = pane.pane_id
     keep_log = bool(cfg["log_enabled"]) and log_pane_allowed(pane.pane_id, cfg)
@@ -785,28 +818,40 @@ async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, 
         fd, tmp_path = tempfile.mkstemp(prefix=f"codex-out-{ts}-{safe_id}-", suffix=".txt")
         os.close(fd)
         out_file = Path(tmp_path)
-    full_prompt = build_prompt(screen, cfg)
 
     # codex 0.130 on Windows: `-C C:\...` with backslashes parses fine when the
     # value is quoted as a single arg, but forward-slash form is portable and
     # avoids any future PATH parsing oddities — convert eagerly.
     cwd_arg = str(WATCHER_DIR).replace("\\", "/")
+    # Windows: asyncio.create_subprocess_exec calls CreateProcessW which does
+    # NOT consult PATHEXT, so a bare `codex` misses `codex.cmd`/`codex.bat`
+    # shims (npm/yarn install codex CLI as `.cmd` on Windows). shutil.which()
+    # walks PATHEXT and returns the resolved path. POSIX falls through fine.
+    codex_bin = cfg.get("codex_binary", "codex")
+    resolved = shutil.which(codex_bin) or codex_bin
+    # Pass prompt via stdin (using `-` as positional) instead of CLI arg.
+    # Windows: codex CLI ships as `codex.cmd` shim → spawned via cmd.exe /c,
+    # which re-parses args and interprets `<`, `>`, `|`, `&`, `%`, `^` as
+    # metacharacters. The prompt contains literal `<reply text>` and `> ` etc,
+    # so cmd would mangle it before codex sees it. stdin path bypasses cmd
+    # entirely. POSIX behaves identically — codex docs: "If not provided as
+    # an argument (or if `-` is used), instructions are read from stdin".
     args = [
-        cfg.get("codex_binary", "codex"), "exec",
+        resolved, "exec",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox", "read-only",
         "-C", cwd_arg,
         "--output-schema", str(SCHEMA_PATH),
         "--output-last-message", str(out_file),
-        full_prompt,
+        "-",
     ]
     log.info("codex exec → pane=%d (prompt %d chars)", pane.pane_id, len(full_prompt))
     # start_new_session=True is POSIX-only (calls setsid). On Windows use
     # CREATE_NEW_PROCESS_GROUP via creationflags so terminate() sends CTRL_BREAK
     # to codex without affecting the parent daemon's console.
     subprocess_kwargs: dict[str, Any] = {
-        "stdin": asyncio.subprocess.DEVNULL,
+        "stdin": asyncio.subprocess.PIPE,
         "stdout": asyncio.subprocess.DEVNULL,
         "stderr": asyncio.subprocess.PIPE,
     }
@@ -818,7 +863,10 @@ async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, 
         proc = await asyncio.create_subprocess_exec(*args, **subprocess_kwargs)
         timeout = float(cfg["codex_timeout_seconds"])
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(input=full_prompt.encode("utf-8")),
+                timeout=timeout,
+            )
         except asyncio.TimeoutError:
             log.error("codex timed out after %.0fs for pane=%d; terminating", timeout, pane.pane_id)
             proc.terminate()
@@ -879,7 +927,14 @@ async def apply_action(
 
 # ---------- audit log ----------------------------------------------------------
 
-def audit(pane: Pane, snapshot: str, decision: dict[str, Any], outcome: str, cfg: dict[str, Any]) -> None:
+def audit(
+    pane: Pane,
+    snapshot: str,
+    decision: dict[str, Any],
+    outcome: str,
+    cfg: dict[str, Any],
+    codex_prompt: str | None = None,
+) -> None:
     if not cfg["log_enabled"]:
         return
     if not log_pane_allowed(pane.pane_id, cfg):
@@ -894,6 +949,7 @@ def audit(pane: Pane, snapshot: str, decision: dict[str, Any], outcome: str, cfg
         "outcome": outcome,
         "decision": decision,
         "snapshot": snapshot,
+        "codex_prompt": codex_prompt,
     }
     fn = TRIGGER_DIR / f"{int(time.time())}-{pane.pane_id}.json"
     fn.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -946,15 +1002,20 @@ async def handle_pane(
                         log.exception("audit write failed")
                     return
 
+            codex_prompt = build_prompt(snapshot, cfg)
             try:
-                decision = await call_codex(pane, snapshot, cfg)
+                decision = await call_codex(pane, codex_prompt, cfg)
             except Exception as e:
                 log.error("codex call failed for %s: %s", pane.pane_id, e)
                 now = time.time()
                 state.responses_in_window.append(now)
                 state.cooldown_until = now + cooldown
                 try:
-                    audit(pane, snapshot, {"action": "error", "error": str(e)[:500]}, "codex-error", cfg)
+                    audit(
+                        pane, snapshot,
+                        {"action": "error", "error": str(e)[:500]},
+                        "codex-error", cfg, codex_prompt=codex_prompt,
+                    )
                 except Exception:
                     log.exception("audit write failed")
                 return
@@ -979,7 +1040,7 @@ async def handle_pane(
             state.responses_in_window.append(now)
             state.cooldown_until = now + float(cfg["per_pane_cooldown_seconds"])
             try:
-                audit(pane, snapshot, decision, outcome, cfg)
+                audit(pane, snapshot, decision, outcome, cfg, codex_prompt=codex_prompt)
             except Exception:
                 log.exception("audit write failed")
     finally:
