@@ -50,12 +50,21 @@ action。
    `text`/`key` 可能觸發不可逆操作（大代價）。模糊時偏 skip，
    **但畫面明顯有等待答案的問題時，請優先給答案而非 skip。**
 
+═══ 符號圖例（畫面已預處理，請依此語意解讀） ═══
+- `> <文字>`   → conversation 內**已 submit 的歷史 user 訊息**（不可變、僅供脈絡，
+  不代表正在等待輸入）。**絕對不可**因為看到 `>` 開頭的長字串就判 user-mid-compose。
+- `❯ <文字>`   → 底部 input box cursor + **未送出的草稿**（罕見；可能是上輪
+  自動化已 type 但 Enter 未送的 stale state）。
+- `❯ <數字>.` → 編號選單 cursor，顯示目前 default 選項。
+- 空 input box（`❯ ` + 空白 + 兩條水平線包夾）已被預處理移除，畫面看不到時
+  代表 input box 是空的、等待新輸入。
+
 ═══ 5W1H 推理流程（內部依序回答後才產 action） ═══
 - **What**：畫面尾段屬哪一類？編號選單 / 自由文字輸入框 / 純訊息 / 純閒置。
 - **Who**：提問者是 Claude Code TUI（真實問題），不是 user 打字中。
-- **When**：狀態新鮮嗎？`❯ ` 空輸入（新鮮）vs `❯ <已有文字>`
+- **When**：狀態新鮮嗎？畫面無 `❯` 結尾（空 input box，新鮮）vs `❯ <已有文字>`
   （可能上輪自動化已 type 但 Enter 未送的 stale state）。
-- **Where**：游標 `❯` 落在哪一行？空輸入行還是某個編號選項上？
+- **Where**：游標 `❯` 落在哪一行？編號選項上、還是 input box 草稿上？
 - **Why**：往上掃畫面，提示在問什麼？權限／確認／計畫核准／自由回答？
 - **How**：對照下方決策表選 action。
 
@@ -801,6 +810,68 @@ def is_capture_truncated(screen: str) -> bool:
     return True
 
 
+_CONV_USER_PREFIX_RE = re.compile(r"^(\s*)❯\s+(\S.*)$")
+
+
+def _rewrite_conversation_user_prefix(text: str) -> str:
+    r"""Rewrite line-leading `❯ <text>` in the conversation region to `> <text>`.
+
+    Claude Code TUI uses `❯` for three distinct things: (a) the bottom input
+    box cursor (`❯ ` + NBSP), (b) the menu cursor (`❯ 1. Yes`), and (c) the
+    prefix Claude renders for already-submitted user messages in the
+    conversation scrollback. Codex cannot distinguish (a) from (c) when the
+    bottom input box is stripped, leading to false `skip user-mid-compose`
+    when conversation history starts with a long `❯ ...` line.
+
+    Strategy: locate the bottom input-box region (HR + empty `❯` / queued
+    drafts + HR) and rewrite `❯ <text>` to `> <text>` ONLY above that region.
+    Menu cursor lines (`❯ \d+[.)]`) are preserved so action `key` / `enter`
+    decisions still work. The bottom input box itself is left untouched so
+    `_strip_input_box_tail` can remove it downstream.
+    """
+    lines = text.splitlines()
+    n = len(lines)
+    box_start = n
+
+    i = n - 1
+    while i >= 0:
+        s = lines[i].strip()
+        if not s or s.startswith(QUEUE_MARKER):
+            i -= 1
+            continue
+        break
+
+    if i >= 0 and is_hr_line(lines[i]):
+        # Walk up through interior (anything that isn't another HR). If the
+        # interior contains at least one `❯` line (empty, placeholder, or
+        # drafted), treat the HR-HR sandwich as the input-box region so the
+        # cursor `❯` semantics inside the box are preserved.
+        j = i - 1
+        found_prompt = False
+        while j >= 0 and not is_hr_line(lines[j]):
+            if lines[j].lstrip().startswith("❯"):
+                found_prompt = True
+            j -= 1
+        if j >= 0 and is_hr_line(lines[j]) and found_prompt:
+            box_start = j
+
+    out: list[str] = []
+    for idx, line in enumerate(lines):
+        if idx >= box_start:
+            out.append(line)
+            continue
+        m = _CONV_USER_PREFIX_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        indent, rest = m.group(1), m.group(2)
+        if NUMBERED_LIST_RE.match(rest):
+            out.append(line)
+            continue
+        out.append(f"{indent}> {rest}")
+    return "\n".join(out)
+
+
 def _strip_input_box_tail(text: str) -> str:
     """Drop the trailing empty input box and any queued drafts. Codex only
     needs the conversation tail (Claude's last question/output) to decide;
@@ -1102,7 +1173,8 @@ def build_prompt(
     cleaned = _clean_screen(screen)
     fallback = int(cfg.get("prompt_context_lines", 60))
     trimmed = _trim_to_current_decision(cleaned, fallback)
-    stripped = _strip_input_box_tail(trimmed)
+    rewritten = _rewrite_conversation_user_prefix(trimmed)
+    stripped = _strip_input_box_tail(rewritten)
     return PROMPT_TEMPLATE.format(
         screen=stripped,
         session_context=_format_session_context(session_meta),
