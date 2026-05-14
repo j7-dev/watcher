@@ -8,8 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 兩條觸發路徑並存：
 
-- **Stop hook（主路徑、即時）**：Claude Code turn 結束 → `hooks/claude-stop-notify.py` 把 `$WEZTERM_PANE` 透過 **TCP loopback** 推給 daemon → 跳過 `stable_count_required` 檢查、直接評估。
-- **輪詢（fallback）**：`poll_interval_seconds`（預設 60s）跑一次 `wezterm cli list --format json`；要連續 `stable_count_required` 次擷取相同才算靜止。**不做 PID pre-filter**——所有 pane 都 capture，靠 `classify()` 視覺指紋（NBSP `❯` + HR 線 + Braille spinner）過濾。
+- **Stop hook（主路徑、即時）**：Claude Code turn 結束 → `hooks/claude-stop-notify.py` 把 `$WEZTERM_PANE` 透過 **TCP loopback** 推給 daemon → 直接評估。
+- **輪詢（fallback）**：`poll_interval_seconds`（預設 60s）跑一次 `wezterm cli list --format json`；每次擷取分類後即評估觸發條件（無連續靜止判斷）。**不做 PID pre-filter**——所有 pane 都 capture，靠 `classify()` 視覺指紋（NBSP `❯` + HR 線 + `esc to interrupt` footer）過濾。
 
 ## 常用指令
 
@@ -67,7 +67,7 @@ WezTerm pane id 是**整數**（例如 `4`、`13`），不是 tmux 的 `%18`。`
 
 ### 觸發 gate 流程（`should_trigger` → `evaluate_pane` → `handle_pane`）
 
-通過分類後依序檢查：`disabled` / `in_flight` → 冷卻 `cooldown_until` → 是否屬於 `input`/`menu` → （poll 路徑才檢查）`stable_count_required` 連續相同 → killswitch 時間窗（`response_window_minutes` 內超過 `max_responses_per_window` 次永久停用該 pane，**只能重啟 daemon 才能恢復**）。
+通過分類後依序檢查：`disabled` / `in_flight` → 冷卻 `cooldown_until` → 是否屬於 `input`/`menu` → killswitch 時間窗（`response_window_minutes` 內超過 `max_responses_per_window` 次永久停用該 pane，**只能重啟 daemon 才能恢復**）。
 
 `handle_pane` 內**呼叫 codex 前**還有兩道便宜短路（省 token / 省 codex round-trip）：
 
@@ -96,12 +96,12 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 
 在 send-text 前**再抓一次畫面**和 baseline 比對，不同就回 `aborted-pane-changed`，防止 codex 思考期間人為操作被覆蓋。`action`：
 
-- `text` → `wezterm cli send-text --no-paste --pane-id N` payload `<value>\r`（單次 call、`\r` 嵌在 payload 內）
-- `key`  → 同上，payload `<digit>\r`（`value` 必須是長度 1 的數字）
-- `enter` → 同上，payload `\r`
+- `text` → 兩次 `wezterm cli send-text --no-paste --pane-id N` call：第一次送 `<value>`（無 CR）、`asyncio.sleep(0.15)`、第二次送 `\r`。**不要把 text + `\r` 合在同一 payload**——Claude Code 的輸入處理會把整批當 paste-like 處理，trailing `\r` 變成「輸入內換行」而非 submit。兩 call 都帶 `--no-paste`、中間 small delay 讓 TUI 把第二次當乾淨的 Enter keystroke。
+- `key`  → 單次 call，payload `<digit>\r`（`value` 必須是長度 1 的數字）。短 payload 不會觸發 paste-like 啟發。
+- `enter` → 單次 call，payload `\r`
 - `skip` → 不動、寫 audit
 
-**重要**：`--no-paste` 是強制的——預設 bracketed-paste 模式會被 Claude Code TUI 當作貼上資料而非按鍵，可能不會自動送出。Phase 1 spike R2 已驗證單次 call + payload 內嵌 `\r` 在 Claude Code TUI 等同按 Enter。
+**重要**：`--no-paste` 是強制的——預設 bracketed-paste 模式會被 Claude Code TUI 當作貼上資料而非按鍵，可能不會自動送出。長字串 + `\r` 的單次 call 即使加 `--no-paste` 仍會被 TUI 當 paste burst → 拆兩次 call 才能穩定 submit（已實測長中文 reply 失敗、拆 call 後正常）。
 
 ### Stop hook 通道（TCP loopback）
 
@@ -149,6 +149,6 @@ Phase 1 spike R3 驗證 **Claude Code 會把 `WEZTERM_PANE` 環境變數傳入 S
 - **不要把 `pane_id` 改回字串**——它是 int，貫穿 audit log、state file key、wezterm cli 參數。`milestone-toggle.json` 內 key 雖然是 str（JSON 強制），但讀寫時都用 `str(pane_id)` 包裝。
 - **`wezterm cli` 任何呼叫都要 wrap try/except**（`CalledProcessError` / `TimeoutExpired` / `FileNotFoundError`），失敗時 warn log + 空回傳值，**不允許 daemon 因此 crash**。新增 wezterm 呼叫處請照樣處理。
 - **WezTerm GUI 未啟動時** `wezterm cli list` 會失敗——daemon 應 graceful 空集合下一輪重試，**不退出**。
-- **`apply_action` send-text 必加 `--no-paste`** 並把 `\r` 嵌進 payload；分兩次 call（先字後 Enter）會被 Claude Code 當 paste 處理、可能不送出。
+- **`apply_action` send-text 必加 `--no-paste`**。`key` / `enter` 兩個 action 把 `\r` 嵌在 payload；`text` 必須拆兩次 call（text → sleep 0.15s → `\r`），否則長字串會被 Claude Code TUI 當 paste 處理 trailing CR 不 submit。
 - Codex CLI 旗標若報錯，先看 `https://developers.openai.com/codex/cli/reference`——CLI 改版頻繁（例如 `--ask-for-approval` 已被砍）。
 - Windows 平台 gotcha：`loop.add_signal_handler` 在 ProactorEventLoop 會 raise `NotImplementedError`，已用 try/except 包裹；`start_new_session` 是 POSIX-only，Windows 走 `creationflags=CREATE_NEW_PROCESS_GROUP` 路徑。

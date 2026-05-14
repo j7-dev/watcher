@@ -59,10 +59,27 @@ PROMPT_TEMPLATE = """\
     與「永久核准」（"Yes, and don't ask again"、"Always allow"）兩個
     選項時，**永遠優先選一次性**。永久核准會移除未來的檢查點，
     且難以反悔。
-  - 看到 `❯` 自由文字輸入框時，優先用 action="text" 回覆精簡內容，
-    直接回答畫面上可見的問題。若最後的問題是明確的 yes/no 或單詞
-    確認，直接回答它。
-  - 看到 `❯ 1.` 樣式的選單行時，優先用 action="key" 配對對應的數字。
+  - 看到 `❯` 自由文字輸入框時：
+    * 若 `❯ ` 後**空白**（empty input）→ 用 action="text" 回覆精簡內容，
+      直接回答畫面上可見的問題。yes/no 或單詞確認就直接回答。
+    * 若 `❯ <已有文字>`（filled input，常見原因是先前自動化已 type 但
+      Enter 沒成功送出）→ 評估那段已有文字是否合理回答了畫面上方可見
+      的問題：
+        - 合理 → 用 action="enter" 直接 submit（接受已輸入內容）。
+        - 文字明顯是 user 半途打到一半的草稿，或答非所問
+          → action="skip" 並寫 `value="user-mid-compose"` 或
+          `value="filled-input-mismatch"`。
+      ⚠️ filled input **不要回 action="text"**——`send-text` 是 type-append
+      不是 replace，新文字會被串接在既有文字後面變成亂碼。要嘛 enter，
+      要嘛 skip。預設傾向 enter——已 type 出來的文字通常是上一輪自動化
+      決定，此時 submit 比重打更安全。
+  - 看到 `❯ 1.` 樣式的選單時：若游標 `❯` 已落在你想選的選項上
+    （多半是 `❯ 1.`，且該選項就是你要選的），**優先用 action="enter"**
+    （接受游標所在的預設項），不要送 action="key"。只有當你要切到
+    **非游標所在**的選項時，才用 action="key" 配對該選項的數字
+    （例如游標在 1 但你判斷該選 3 → action="key" value="3"）。
+    理由：直接按 Enter 永遠等同接受畫面上反白的那一行，最不會誤觸；
+    而 action="key" 在某些 TUI 狀態下會被當成字元輸入而非選單捷徑。
   - Plan Mode 確認（Claude 提出多步驟計畫並請求繼續）：若可見的計畫
     內容看起來完整且合理，核准它。若計畫框看起來在頂端被截斷
     （你看得到收尾的 `╰` 邊框，卻看不到對應的 `╭` 起頭），
@@ -140,7 +157,7 @@ QUEUE_MARKER = "｜"
 _WELCOME_MARKERS = ("Welcome back", "Tips for getting started", "/release-notes for more")
 _STATUSLINE_RE = re.compile(r"📂")               # status line: model badge/dir/branch (📂 is unique anchor)
 _FOOTER_RE     = re.compile(r"^\s*⏵⏵\s+(bypass|auto-accept)")  # bottom mode hint
-_BAKED_RE      = re.compile(r"^\s*✻\s+\w+\s+for\s+")            # spinner counter line
+_BAKED_RE      = re.compile(r"^\s*\S\s+\S.*?(?:[…\.]+\s*\(\d|\s+for\s+\d+\s*[ms])")  # spinner status: "✻ Sautéed for 6m 53s" / "✶ Nebulizing… (24m 54s · ...)" / "✻ Scaffolding monorepo root… (1h 2m 44s · ...)"
 _TOKEN_RE      = re.compile(r"^\s*\d+\s+tokens\s*$")            # `114738 tokens` line
 
 
@@ -250,7 +267,6 @@ def log_pane_allowed(pane_id: int, cfg: dict[str, Any]) -> bool:
 
 DEFAULTS: dict[str, Any] = {
     "poll_interval_seconds": 180,
-    "stable_count_required": 2,
     "per_pane_cooldown_seconds": 15,
     "max_responses_per_window": 5,
     "response_window_minutes": 5,
@@ -370,7 +386,6 @@ class Pane:
 
 @dataclasses.dataclass(slots=True)
 class PaneState:
-    history: deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=8))
     last_classification: str = "unknown"
     cooldown_until: float = 0.0
     responses_in_window: deque[float] = dataclasses.field(default_factory=deque)
@@ -385,8 +400,8 @@ class PaneState:
 # (not `%N` strings); there is no `pane_current_command` field, so we drop
 # the `cmd == "claude"` pre-filter and let classify() do the heavy lifting
 # via visual fingerprints (NBSP `❯`, HR lines with embedded session label,
-# Braille spinner). False positives in pane discovery are filtered out by
-# classify() returning "other"; cost of capturing all panes is negligible
+# `esc to interrupt` footer). False positives in pane discovery are filtered
+# out by classify() returning "other"; cost of capturing all panes is negligible
 # (poll_interval default 180s × ~20 panes = <0.12 wezterm calls/sec).
 
 WEZTERM_BIN = "wezterm"
@@ -703,16 +718,7 @@ def capture_pane_adaptive(pane_id: int, cfg: dict[str, Any]) -> str:
 
 # ---------- classification -----------------------------------------------------
 
-def is_spinner_title(title: str) -> bool:
-    s = title.strip()
-    if not s:
-        return False
-    return 0x2800 <= ord(s[0]) <= 0x28FF
-
-
-def is_working(screen: str, title: str) -> bool:
-    if is_spinner_title(title):
-        return True
+def is_working(screen: str) -> bool:
     # Only check the bottom status bar — `(ctrl+o to expand)` legitimately
     # appears deeper in scrollback inside collapsed tool-output blocks
     # (`+N lines (ctrl+o to expand)`), which would falsely look like working.
@@ -720,7 +726,13 @@ def is_working(screen: str, title: str) -> bool:
     return any(h in tail for h in WORKING_HINTS)
 
 
-def _has_empty_input_box(screen: str) -> bool:
+def _has_input_box(screen: str) -> bool:
+    """Detect an `❯ ...` input row sandwiched between two HR lines — accept
+    both empty `❯ ` (waiting for user) and filled `❯ <text>` (text already
+    typed but not submitted, e.g. orphaned from a prior failed `text` action).
+    The queue lines below the box start with `｜`, not `❯`, so they don't
+    match. codex sees the filled text and decides enter (submit) vs text
+    (replace) vs skip (user clearly mid-composing)."""
     lines = screen.rstrip("\n").splitlines()
     n = len(lines)
     if n < 3:
@@ -731,7 +743,7 @@ def _has_empty_input_box(screen: str) -> bool:
         j = i - 1
         while j > 0 and not lines[j].strip():
             j -= 1
-        if not is_empty_prompt_line(lines[j]):
+        if not lines[j].lstrip().startswith("❯"):
             continue
         k = j - 1
         while k > 0 and not lines[k].strip():
@@ -741,13 +753,13 @@ def _has_empty_input_box(screen: str) -> bool:
     return False
 
 
-def classify(screen: str, title: str) -> str:
-    if is_working(screen, title):
+def classify(screen: str) -> str:
+    if is_working(screen):
         return "working"
     tail_lines = screen.splitlines()[-30:]
     if any(MENU_CHOICE_RE.match(l) for l in tail_lines):
         return "menu"
-    if _has_empty_input_box(screen):
+    if _has_input_box(screen):
         return "input"
     return "other"
 
@@ -758,7 +770,6 @@ def should_trigger(
     state: PaneState,
     classification: str,
     cfg: dict[str, Any],
-    require_stable: bool = True,
 ) -> bool:
     if state.disabled or state.in_flight:
         return False
@@ -766,13 +777,6 @@ def should_trigger(
         return False
     if classification not in ("input", "menu"):
         return False
-    if require_stable:
-        need = int(cfg["stable_count_required"])
-        if len(state.history) < need:
-            return False
-        recent = list(state.history)[-need:]
-        if not all(x == recent[0] for x in recent):
-            return False
     # rate-limit window
     now = time.time()
     cutoff = now - float(cfg["response_window_minutes"]) * 60.0
@@ -799,10 +803,9 @@ def evaluate_pane(
     screen = capture_pane_adaptive(pane.pane_id, cfg)
     if not screen:
         return False
-    state.history.append(screen)
-    classification = classify(screen, pane.title)
+    classification = classify(screen)
     state.last_classification = classification
-    if not should_trigger(state, classification, cfg, require_stable=not from_hook):
+    if not should_trigger(state, classification, cfg):
         return False
     state.in_flight = True
     src = "hook" if from_hook else "poll"
@@ -919,7 +922,11 @@ async def apply_action(
     scrollback: int,
 ) -> str:
     fresh = capture_pane(pane.pane_id, scrollback)
-    if fresh != baseline:
+    # Compare chrome-stripped screens so the always-ticking spinner counter line
+    # (`✶ Nebulizing… (52m 24s · …)`) and other status-bar churn don't cause
+    # false-positive aborts during the 5s codex round-trip. Real content edits
+    # (user typed something, menu changed, new prompt) survive `_clean_screen`.
+    if _clean_screen(fresh) != _clean_screen(baseline):
         return "aborted-pane-changed"
     if action == "skip":
         return f"skipped:{(value or '').strip()[:80]}"
@@ -942,10 +949,15 @@ async def apply_action(
         # accidentally firing extra Enters mid-text — terminal control chars
         # in arbitrary LLM output are a footgun.
         sanitized = value.replace("\r", "").replace("\n", " ")
-        # Trail with `\r\n`: `\r` fires submit; `\n` is a defensive trailer in
-        # case the TUI's paste-burst heuristic swallows the lone `\r`. `\n`
-        # alone on already-submitted (empty) buffer is a no-op.
-        wezterm_send_text(pane.pane_id, sanitized + "\r\n")
+        # Two-phase send: typed text first, then Enter as a separate PTY write.
+        # Combining `text + \r` in one buffer makes Claude Code's input handler
+        # treat the burst as paste-like and the trailing CR becomes an in-input
+        # newline rather than a submit. Both calls keep `--no-paste`, so no
+        # bracketed-paste markers wrap either chunk — the TUI sees the second
+        # write as a clean Enter keystroke after the typing has settled.
+        wezterm_send_text(pane.pane_id, sanitized)
+        await asyncio.sleep(0.15)
+        wezterm_send_text(pane.pane_id, "\r")
         return f"text:{len(sanitized)}chars"
     return f"unknown-action:{action!r}"
 
@@ -1187,7 +1199,7 @@ async def handle_milestone_event(
     screen = capture_pane_adaptive(pane.pane_id, cfg)
     if not screen:
         return
-    cls = classify(screen, pane.title)
+    cls = classify(screen)
     if cls == "working":
         log.info("milestone-toggle: pane %d busy (class=%s); skipping inject", pane_id, cls)
         return
@@ -1431,7 +1443,7 @@ async def run_once(cfg: dict[str, Any]) -> int:
         return 0
     for p in panes:
         screen = capture_pane_adaptive(p.pane_id, cfg)
-        cls = classify(screen, p.title)
+        cls = classify(screen)
         print(f"pane={p.pane_id:<4} window={p.window_id} tab={p.tab_id} "
               f"class={cls:<8} title={p.title!r}")
     return 0

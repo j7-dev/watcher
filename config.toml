@@ -5,7 +5,6 @@
 # 全自動化設定：Stop hook 主觸發 (即時)，輪詢 60s 補位。killswitch 放寬以
 # 容忍 codex 多輪自動決策；若擔心走火，調回保守值即可。
 poll_interval_seconds      = 60     # fallback 輪詢間隔 (秒)
-stable_count_required      = 2      # 輪詢路徑：連續幾次畫面相同才算「靜止」、可觸發 (hook 路徑會跳過)
 per_pane_cooldown_seconds  = 30     # 同一 pane 觸發後幾秒內不再觸發
 max_responses_per_window   = 20     # killswitch：時間窗內最多回應次數 (全自動下放寬)
 response_window_minutes    = 10     # killswitch 的時間窗 (分鐘)
