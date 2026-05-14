@@ -49,7 +49,7 @@ Run these steps in order. Print a one-line status after each so the user can fol
    ```
    The label marks an issue as actively in-flight so a human watching the issue tracker can see "someone (the runner) is on it right now". It is added when the subagent starts and removed before the issue closes, regardless of success or skip.
 7. **Loop over issues** — for each open issue in the milestone, **dispatch one subagent** that runs the *Per-issue routine*. Wait for it to return, append its result to the in-memory summary list, move on.
-8. **Summarise** — print a final table: shipped vs. skipped, with reasons for the skips. Then, if `$TMUX_PANE` is set, write a completion marker at `${XDG_STATE_HOME:-$HOME/.local/state}/watcher/milestone-done/$TMUX_PANE.json` containing `{"pane": "$TMUX_PANE", "milestone": "<resolved>", "completed_at": "<ISO timestamp>", "shipped": <n>, "skipped": <n>}`. The watcher daemon checks this file's mtime against the toggle's `enabled_at` to auto-disable the `/watcher:milestone-on` per-pane re-injector; without it the daemon will keep re-firing `/milestone-runner` on every Stop event.
+8. **Summarise** — print a final table: shipped vs. skipped, with reasons for the skips. Then, if `$WEZTERM_PANE` is set, write a completion marker at `${XDG_STATE_HOME:-$HOME/.local/state}/watcher/milestone-done/$WEZTERM_PANE.json` containing `{"pane": "$WEZTERM_PANE", "milestone": "<resolved>", "completed_at": "<ISO timestamp>", "shipped": <n>, "skipped": <n>}`. The watcher daemon checks this file's mtime against the toggle's `enabled_at` to auto-disable the `/watcher:milestone-on` per-pane re-injector; without it the daemon will keep re-firing `/milestone-runner` on every Stop event.
 
 ## Trunk detection
 

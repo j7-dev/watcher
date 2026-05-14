@@ -1,9 +1,9 @@
-"""Watcher daemon: monitor tmux panes running Claude Code, ask Codex CLI what to
-reply, then send keys back via tmux.
+"""Watcher daemon: monitor WezTerm panes running Claude Code on Windows, ask
+Codex CLI what to reply, then send keys back via `wezterm cli send-text`.
 
 Run: `uv run watcher.py`  (or `uv run watcher`)
      `uv run watcher.py --once`     → single discovery/classification tick, no codex
-     `uv run watcher.py --dry-run`  → full loop but skip the final send-keys
+     `uv run watcher.py --dry-run`  → full loop but skip the final send-text
 """
 
 from __future__ import annotations
@@ -223,22 +223,25 @@ def _cache_store(key: str, decision: dict[str, Any], ttl: float, now: float) -> 
             _DECISION_CACHE.pop(k, None)
 
 
-def _normalize_pane_id(raw: str) -> str:
-    s = str(raw).strip()
-    if not s:
-        return ""
-    return s if s.startswith("%") else f"%{s}"
-
-
-def log_pane_allowed(pane_id: str, cfg: dict[str, Any]) -> bool:
+def log_pane_allowed(pane_id: int, cfg: dict[str, Any]) -> bool:
     """Return True if per-pane audit / codex-out logging is permitted for
-    this pane. Empty list (default) = all panes allowed."""
+    this pane. Empty list (default) = all panes allowed. WezTerm pane IDs
+    are integers; legacy string forms (`"%18"` or `"18"`) are accepted in
+    config and coerced via int(), trailing `%` stripped for compatibility.
+    """
     allow = cfg.get("log_pane_ids") or []
     if not allow:
         return True
-    wanted = {_normalize_pane_id(x) for x in allow}
-    wanted.discard("")
-    return _normalize_pane_id(pane_id) in wanted
+    wanted: set[int] = set()
+    for x in allow:
+        s = str(x).strip().lstrip("%")
+        if not s:
+            continue
+        try:
+            wanted.add(int(s))
+        except ValueError:
+            continue
+    return pane_id in wanted
 
 
 # ---------- config & logging ---------------------------------------------------
@@ -251,13 +254,15 @@ DEFAULTS: dict[str, Any] = {
     "response_window_minutes": 5,
     "codex_timeout_seconds": 90,
     "codex_binary": "codex",
-    "capture_scrollback_lines": 200,
+    "capture_scrollback_lines": 100,
     "capture_escalation_step": 400,
     "max_capture_scrollback_lines": 2000,
     "prompt_context_lines": 60,
     "hr_min_length": 50,
     "socket_enabled": True,
-    "socket_path": "",
+    "socket_host": "127.0.0.1",
+    "socket_port": 47823,
+    "socket_token": "",
     "log_enabled": False,
     "log_format": "%(asctime)s %(levelname)s %(message)s",
     "log_datefmt": "%Y-%m-%d %H:%M:%S",
@@ -276,15 +281,11 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
-def default_socket_path() -> str:
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "default"
-    base = runtime if runtime else "/tmp"
-    return f"{base}/watcher-{user}.sock"
-
-
-def resolve_socket_path(cfg: dict[str, Any]) -> str:
-    return str(cfg["socket_path"]).strip() or default_socket_path()
+def socket_info_path() -> Path:
+    """Per-user file recording the TCP host/port the daemon is listening on.
+    Stop-hook reads this to find a running daemon without hardcoding the port.
+    """
+    return Path.home() / ".watcher" / "socket-info.json"
 
 
 def _coerce(default: Any, raw: str) -> Any:
@@ -358,11 +359,11 @@ def prune_old_triggers(cfg: dict[str, Any]) -> int:
 
 @dataclasses.dataclass(slots=True)
 class Pane:
-    pane_id: str   # tmux #{pane_id}, e.g. "%3" — stable for pane lifetime
-    target: str   # session:window.pane, valid for -t
-    pid: int
-    cmd: str
-    title: str
+    pane_id: int      # WezTerm pane id (integer, stable for pane lifetime)
+    window_id: int    # WezTerm window id
+    tab_id: int       # WezTerm tab id
+    workspace: str    # WezTerm workspace name (often empty)
+    title: str        # WezTerm pane title (foreground process / shell hint)
 
 
 @dataclasses.dataclass(slots=True)
@@ -376,42 +377,108 @@ class PaneState:
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
 
 
-# ---------- tmux helpers -------------------------------------------------------
+# ---------- wezterm helpers ----------------------------------------------------
+#
+# WezTerm replaces tmux as the terminal multiplexer. Pane IDs are integers
+# (not `%N` strings); there is no `pane_current_command` field, so we drop
+# the `cmd == "claude"` pre-filter and let classify() do the heavy lifting
+# via visual fingerprints (NBSP `❯`, HR lines with embedded session label,
+# Braille spinner). False positives in pane discovery are filtered out by
+# classify() returning "other"; cost of capturing all panes is negligible
+# (poll_interval default 180s × ~20 panes = <0.12 wezterm calls/sec).
 
-SEP = "\t"  # Tab — tmux escapes control chars < 0x20 (except tab/newline) to literal "\nnn"
-
-def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=True, **kw)
+WEZTERM_BIN = "wezterm"
 
 
-def discover_panes(my_pid: int) -> list[Pane]:
-    fmt = SEP.join([
-        "#{pane_id}",
-        "#{session_name}:#{window_index}.#{pane_index}",
-        "#{pane_pid}",
-        "#{pane_current_command}",
-        "#{pane_title}",
-    ])
+def _wezterm_run(args: list[str], timeout: float = 5.0,
+                 stdin_input: str | None = None) -> str:
+    """Invoke `wezterm cli <args>`, return stdout. Raises CalledProcessError
+    on non-zero exit. Callers MUST wrap to graceful failure (no crash).
+    """
+    return subprocess.run(
+        [WEZTERM_BIN, "cli", *args],
+        capture_output=True, text=True, check=True, timeout=timeout,
+        input=stdin_input,
+    ).stdout
+
+
+def wezterm_list_panes() -> list[dict[str, Any]]:
+    """Return raw pane list from `wezterm cli list --format json`, or [] on
+    any failure (GUI not running, JSON malformed, executable missing).
+    """
     try:
-        out = _run(["tmux", "list-panes", "-a", "-F", fmt]).stdout
-    except subprocess.CalledProcessError as e:
-        log.warning("tmux list-panes failed: %s", e.stderr.strip())
+        raw = _wezterm_run(["list", "--format", "json"], timeout=3.0)
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            log.warning("wezterm cli list returned non-list: %r", type(data))
+            return []
+        return data
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, json.JSONDecodeError) as e:
+        log.warning("wezterm cli list failed: %s", e)
         return []
+
+
+def wezterm_get_text(pane_id: int, scrollback: int = 100) -> str:
+    """Capture pane content as plain text (no ANSI escapes). WezTerm's
+    `--start-line -N` requests up to N lines from above the visible screen;
+    Claude Code uses alt-screen so scrollback past the viewport is generally
+    unavailable, but the viewport (~40-50 lines) already contains everything
+    classify() needs.
+    """
+    try:
+        # --escapes preserves SGR; we want them for _strip_ghost_text() to
+        # detect dim/reverse-video attributes on autocomplete suggestions.
+        return _strip_ghost_text(_wezterm_run(
+            ["get-text", "--pane-id", str(pane_id),
+             "--escapes",
+             "--start-line", f"-{max(scrollback, 1)}"],
+            timeout=3.0,
+        ))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError) as e:
+        log.warning("wezterm cli get-text pane=%d failed: %s", pane_id, e)
+        return ""
+
+
+def wezterm_send_text(pane_id: int, payload: str) -> None:
+    """Send raw text to a pane WITHOUT bracketed-paste wrapping. Embed `\\r`
+    inside `payload` to fire Enter as part of the same call — verified in
+    Phase 1 spike (R2) that Claude Code TUI treats this as native keystrokes
+    rather than paste data.
+    """
+    subprocess.run(
+        [WEZTERM_BIN, "cli", "send-text", "--no-paste",
+         "--pane-id", str(pane_id)],
+        input=payload, text=True, check=True, timeout=3.0,
+    )
+
+
+def wezterm_pane_exists(pane_id: int) -> bool:
+    """Cheap existence check for a pane (used to clean up stale state)."""
+    return any(int(p.get("pane_id", -1)) == pane_id for p in wezterm_list_panes())
+
+
+def discover_panes(_my_pid: int) -> list[Pane]:
+    """Enumerate every WezTerm pane. `_my_pid` retained for signature
+    compatibility (used to skip the daemon's own pane in the tmux era)
+    but no longer needed — wezterm cli list never includes the daemon's
+    own python process anyway.
+    """
+    _ = _my_pid  # kept for compatibility
     panes: list[Pane] = []
-    for line in out.splitlines():
-        parts = line.split(SEP)
-        if len(parts) < 5:
-            continue
-        pane_id, target, pid_s, cmd, title = parts[0], parts[1], parts[2], parts[3], SEP.join(parts[4:])
+    for entry in wezterm_list_panes():
         try:
-            pid = int(pid_s)
-        except ValueError:
+            panes.append(Pane(
+                pane_id=int(entry["pane_id"]),
+                window_id=int(entry.get("window_id", 0)),
+                tab_id=int(entry.get("tab_id", 0)),
+                workspace=str(entry.get("workspace", "")),
+                title=str(entry.get("title", "")),
+            ))
+        except (KeyError, ValueError, TypeError) as e:
+            log.warning("malformed pane entry %r: %s", entry, e)
             continue
-        if pid == my_pid:
-            continue
-        if cmd.strip() != "claude":
-            continue
-        panes.append(Pane(pane_id=pane_id, target=target, pid=pid, cmd=cmd, title=title))
     return panes
 
 
@@ -470,13 +537,10 @@ def _strip_ghost_text(raw: str) -> str:
     return "".join(out)
 
 
-def capture_pane(target: str, scrollback: int = 200) -> str:
-    try:
-        out = _run(["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", f"-{scrollback}"]).stdout
-    except subprocess.CalledProcessError as e:
-        log.warning("capture-pane %s failed: %s", target, e.stderr.strip())
-        return ""
-    return _strip_ghost_text(out)
+def capture_pane(pane_id: int, scrollback: int = 100) -> str:
+    """Compatibility shim — delegates to wezterm_get_text. Kept to minimize
+    diff in capture_pane_adaptive() and apply_action()."""
+    return wezterm_get_text(pane_id, scrollback)
 
 
 _TRUNCATION_BOTTOM_WINDOW = 15  # how far up from the bottom we still treat a `╰` as "current"
@@ -539,25 +603,25 @@ def _trim_to_current_decision(screen: str, fallback_lines: int) -> str:
     return "\n".join(lines[-fallback_lines:])
 
 
-def capture_pane_adaptive(target: str, cfg: dict[str, Any]) -> str:
+def capture_pane_adaptive(pane_id: int, cfg: dict[str, Any]) -> str:
     """Capture pane content, escalating scrollback if a bordered box is
     detected as truncated above the captured window. Stops when no longer
     truncated, when scrollback hits max, or when a larger capture returns
-    identical content (tmux history exhausted).
+    identical content (wezterm alt-screen tends to cap out quickly).
     """
     scrollback = int(cfg["capture_scrollback_lines"])
     max_sb = int(cfg["max_capture_scrollback_lines"])
     step = int(cfg["capture_escalation_step"])
-    screen = capture_pane(target, scrollback)
+    screen = capture_pane(pane_id, scrollback)
     if not screen:
         return screen
     while is_capture_truncated(screen) and scrollback < max_sb:
         next_sb = min(scrollback + step, max_sb)
-        bigger = capture_pane(target, next_sb)
+        bigger = capture_pane(pane_id, next_sb)
         if not bigger or bigger == screen:
             break
-        log.info("escalated scrollback %d → %d for %s (truncated box)",
-                 scrollback, next_sb, target)
+        log.info("escalated scrollback %d → %d for pane=%d (truncated box)",
+                 scrollback, next_sb, pane_id)
         screen = bigger
         scrollback = next_sb
     return screen
@@ -678,7 +742,7 @@ def evaluate_pane(
 ) -> bool:
     """Capture pane, classify, and schedule handle_pane if conditions met.
     Returns True if a handler was scheduled."""
-    screen = capture_pane_adaptive(pane.target, cfg)
+    screen = capture_pane_adaptive(pane.pane_id, cfg)
     if not screen:
         return False
     state.history.append(screen)
@@ -688,7 +752,7 @@ def evaluate_pane(
         return False
     state.in_flight = True
     src = "hook" if from_hook else "poll"
-    log.info("evaluate %s class=%s src=%s — scheduling handler", pane.target, classification, src)
+    log.info("evaluate pane=%d class=%s src=%s — scheduling handler", pane.pane_id, classification, src)
     asyncio.create_task(handle_pane(pane, state, screen, cfg, dry_run))
     return True
 
@@ -713,7 +777,7 @@ def _strip_fences(text: str) -> str:
 
 async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, Any]:
     ts = int(time.time())
-    safe_id = pane.pane_id.lstrip("%")
+    safe_id = pane.pane_id
     keep_log = bool(cfg["log_enabled"]) and log_pane_allowed(pane.pane_id, cfg)
     if keep_log:
         out_file = TRIGGER_DIR / f"codex-out-{ts}-{safe_id}.txt"
@@ -723,30 +787,40 @@ async def call_codex(pane: Pane, screen: str, cfg: dict[str, Any]) -> dict[str, 
         out_file = Path(tmp_path)
     full_prompt = build_prompt(screen, cfg)
 
+    # codex 0.130 on Windows: `-C C:\...` with backslashes parses fine when the
+    # value is quoted as a single arg, but forward-slash form is portable and
+    # avoids any future PATH parsing oddities — convert eagerly.
+    cwd_arg = str(WATCHER_DIR).replace("\\", "/")
     args = [
         cfg.get("codex_binary", "codex"), "exec",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox", "read-only",
-        "-C", str(WATCHER_DIR),
+        "-C", cwd_arg,
         "--output-schema", str(SCHEMA_PATH),
         "--output-last-message", str(out_file),
         full_prompt,
     ]
-    log.info("codex exec → %s (prompt %d chars)", pane.target, len(full_prompt))
+    log.info("codex exec → pane=%d (prompt %d chars)", pane.pane_id, len(full_prompt))
+    # start_new_session=True is POSIX-only (calls setsid). On Windows use
+    # CREATE_NEW_PROCESS_GROUP via creationflags so terminate() sends CTRL_BREAK
+    # to codex without affecting the parent daemon's console.
+    subprocess_kwargs: dict[str, Any] = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": asyncio.subprocess.DEVNULL,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if os.name == "nt":
+        subprocess_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        subprocess_kwargs["start_new_session"] = True
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        proc = await asyncio.create_subprocess_exec(*args, **subprocess_kwargs)
         timeout = float(cfg["codex_timeout_seconds"])
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            log.error("codex timed out after %.0fs for %s; terminating", timeout, pane.target)
+            log.error("codex timed out after %.0fs for pane=%d; terminating", timeout, pane.pane_id)
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
@@ -774,29 +848,32 @@ async def apply_action(
     baseline: str,
     scrollback: int,
 ) -> str:
-    fresh = capture_pane(pane.target, scrollback)
+    fresh = capture_pane(pane.pane_id, scrollback)
     if fresh != baseline:
         return "aborted-pane-changed"
     if action == "skip":
         return f"skipped:{(value or '').strip()[:80]}"
+    # Phase 1 spike R2 verified: `wezterm cli send-text --no-paste` with `\r`
+    # appended to the payload fires Enter in a single call (no second
+    # send-text needed, unlike tmux which required separate -l and Enter).
     if action == "enter":
-        _run(["tmux", "send-keys", "-t", pane.target, "Enter"])
+        wezterm_send_text(pane.pane_id, "\r")
         return "enter"
     if action == "key":
         v = (value or "").strip()
         if len(v) != 1 or not v.isdigit():
             return f"invalid-key:{v!r}"
-        _run(["tmux", "send-keys", "-t", pane.target, v])
-        await asyncio.sleep(0.15)
-        _run(["tmux", "send-keys", "-t", pane.target, "Enter"])
+        wezterm_send_text(pane.pane_id, v + "\r")
         return f"key:{v}"
     if action == "text":
         if not value:
             return "empty-text"
-        _run(["tmux", "send-keys", "-t", pane.target, "-l", value])
-        await asyncio.sleep(0.15)
-        _run(["tmux", "send-keys", "-t", pane.target, "Enter"])
-        return f"text:{len(value)}chars"
+        # Drop any embedded \r/\n in the codex-supplied value to avoid
+        # accidentally firing extra Enters mid-text — terminal control chars
+        # in arbitrary LLM output are a footgun.
+        sanitized = value.replace("\r", "").replace("\n", " ")
+        wezterm_send_text(pane.pane_id, sanitized + "\r")
+        return f"text:{len(sanitized)}chars"
     return f"unknown-action:{action!r}"
 
 
@@ -810,14 +887,15 @@ def audit(pane: Pane, snapshot: str, decision: dict[str, Any], outcome: str, cfg
     record = {
         "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "pane_id": pane.pane_id,
-        "target": pane.target,
+        "window_id": pane.window_id,
+        "tab_id": pane.tab_id,
+        "workspace": pane.workspace,
         "title": pane.title,
         "outcome": outcome,
         "decision": decision,
         "snapshot": snapshot,
     }
-    safe_id = pane.pane_id.lstrip("%")
-    fn = TRIGGER_DIR / f"{int(time.time())}-{safe_id}.json"
+    fn = TRIGGER_DIR / f"{int(time.time())}-{pane.pane_id}.json"
     fn.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -832,7 +910,7 @@ async def handle_pane(
 ) -> None:
     try:
         async with state.lock:
-            log.info("trigger %s class=%s title=%r", pane.target, state.last_classification, pane.title)
+            log.info("trigger %s class=%s title=%r", pane.pane_id, state.last_classification, pane.title)
 
             # Pre-codex short-circuits: cache hit, then heuristic skip predictor.
             clean = _clean_screen(snapshot)
@@ -842,7 +920,7 @@ async def handle_pane(
             pre_now = time.time()
             cached = _cache_lookup(shash, pre_now)
             if cached is not None:
-                log.info("cache hit for %s: %s", pane.target, cached.get("action"))
+                log.info("cache hit for %s: %s", pane.pane_id, cached.get("action"))
                 state.cooldown_until = pre_now + cooldown
                 cached_decision = {**cached, "source": "cache"}
                 try:
@@ -858,7 +936,7 @@ async def handle_pane(
                     _build_markers(cfg),
                 )
                 if reason:
-                    log.info("predicted skip for %s: %s", pane.target, reason)
+                    log.info("predicted skip for %s: %s", pane.pane_id, reason)
                     state.cooldown_until = pre_now + cooldown
                     decision = {"action": "skip", "value": reason, "source": "predicted"}
                     _cache_store(shash, decision, cache_ttl, pre_now)
@@ -871,7 +949,7 @@ async def handle_pane(
             try:
                 decision = await call_codex(pane, snapshot, cfg)
             except Exception as e:
-                log.error("codex call failed for %s: %s", pane.target, e)
+                log.error("codex call failed for %s: %s", pane.pane_id, e)
                 now = time.time()
                 state.responses_in_window.append(now)
                 state.cooldown_until = now + cooldown
@@ -882,7 +960,7 @@ async def handle_pane(
                 return
             action = decision.get("action", "")
             value = decision.get("value")
-            log.info("codex decision for %s: action=%s value=%r", pane.target, action, value)
+            log.info("codex decision for %s: action=%s value=%r", pane.pane_id, action, value)
             if action == "skip":
                 _cache_store(shash, dict(decision), cache_ttl, time.time())
             if dry_run:
@@ -894,9 +972,9 @@ async def handle_pane(
                         scrollback=int(cfg["capture_scrollback_lines"]),
                     )
                 except Exception as e:
-                    log.exception("apply_action failed for %s", pane.target)
+                    log.exception("apply_action failed for %s", pane.pane_id)
                     outcome = f"apply-error:{e}"
-            log.info("outcome %s: %s", pane.target, outcome)
+            log.info("outcome %s: %s", pane.pane_id, outcome)
             now = time.time()
             state.responses_in_window.append(now)
             state.cooldown_until = now + float(cfg["per_pane_cooldown_seconds"])
@@ -953,7 +1031,7 @@ def write_toggle_state(data: dict[str, Any], cfg: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def completion_marker_fresh(pane_id: str, entry: dict[str, Any], cfg: dict[str, Any]) -> bool:
+def completion_marker_fresh(pane_id: int, entry: dict[str, Any], cfg: dict[str, Any]) -> bool:
     marker = resolve_completion_marker_dir(cfg) / f"{pane_id}.json"
     if not marker.exists():
         return False
@@ -980,46 +1058,55 @@ def _milestone_rate_limit_ok(entry: dict[str, Any], cfg: dict[str, Any]) -> bool
     return len(fresh) < max_n
 
 
+def _pane_window_tab(pane: Pane) -> str:
+    """WezTerm equivalent of tmux's `session:window.pane` location string —
+    used as the milestone-toggle `session_window` value to detect when a
+    pane is moved between windows/tabs and auto-disable the milestone.
+    """
+    return f"{pane.window_id}:{pane.tab_id}"
+
+
 async def handle_milestone_event(
-    pane_id: str,
-    states: dict[str, PaneState],
+    pane_id: int,
+    states: dict[int, PaneState],
     cfg: dict[str, Any],
     dry_run: bool,
 ) -> None:
     """Toggle ON for this pane. Re-inject the milestone command unless the
     completion marker says we are done, the pane is busy, or rate-limit trips."""
     state_data = read_toggle_state(cfg)
-    entry = state_data.get("panes", {}).get(pane_id)
+    entry = state_data.get("panes", {}).get(str(pane_id))
     if not entry or not entry.get("enabled"):
         return
     if completion_marker_fresh(pane_id, entry, cfg):
         entry["enabled"] = False
         entry["completed_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         write_toggle_state(state_data, cfg)
-        log.info("milestone-toggle auto-off pane=%s (completion marker)", pane_id)
+        log.info("milestone-toggle auto-off pane=%d (completion marker)", pane_id)
         return
     panes = discover_panes(os.getpid())
     pane = next((p for p in panes if p.pane_id == pane_id), None)
     if pane is None:
-        log.info("milestone-toggle: pane %s not found; skipping", pane_id)
+        log.info("milestone-toggle: pane %d not found; skipping", pane_id)
         return
     expected_window = entry.get("session_window")
-    if expected_window and pane.target != expected_window:
-        log.warning("milestone-toggle: pane %s window changed (%s -> %s); auto-off",
-                    pane_id, expected_window, pane.target)
+    current_window = _pane_window_tab(pane)
+    if expected_window and current_window != expected_window:
+        log.warning("milestone-toggle: pane %d window changed (%s -> %s); auto-off",
+                    pane_id, expected_window, current_window)
         entry["enabled"] = False
         write_toggle_state(state_data, cfg)
         return
     state = states.setdefault(pane_id, PaneState())
-    screen = capture_pane_adaptive(pane.target, cfg)
+    screen = capture_pane_adaptive(pane.pane_id, cfg)
     if not screen:
         return
     cls = classify(screen, pane.title)
     if cls in ("working", "drafting"):
-        log.info("milestone-toggle: pane %s busy (class=%s); skipping inject", pane_id, cls)
+        log.info("milestone-toggle: pane %d busy (class=%s); skipping inject", pane_id, cls)
         return
     if not _milestone_rate_limit_ok(entry, cfg):
-        log.warning("milestone-toggle killswitch pane=%s (>= %d injects in %.1f min)",
+        log.warning("milestone-toggle killswitch pane=%d (>= %d injects in %.1f min)",
                     pane_id,
                     int(cfg["milestone_max_reinjects_per_window"]),
                     float(cfg["response_window_minutes"]))
@@ -1028,62 +1115,69 @@ async def handle_milestone_event(
         return
     cmd = str(cfg.get("milestone_command_text") or "/milestone-runner")
     if dry_run:
-        log.info("milestone-toggle: dry-run inject %r into %s", cmd, pane.target)
+        log.info("milestone-toggle: dry-run inject %r into pane=%d", cmd, pane.pane_id)
         entry.setdefault("reinjects", []).append(time.time())
         write_toggle_state(state_data, cfg)
         return
     try:
-        _run(["tmux", "send-keys", "-t", pane.target, "-l", cmd])
-        await asyncio.sleep(0.15)
-        _run(["tmux", "send-keys", "-t", pane.target, "Enter"])
-    except subprocess.CalledProcessError as e:
-        log.warning("milestone-toggle: send-keys failed for %s: %s", pane.target,
-                    (e.stderr or "").strip())
+        wezterm_send_text(pane.pane_id, cmd + "\r")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError) as e:
+        log.warning("milestone-toggle: send-text failed for pane=%d: %s",
+                    pane.pane_id, e)
         return
     state.cooldown_until = time.time() + float(cfg["milestone_reinject_cooldown_seconds"])
     entry.setdefault("reinjects", []).append(time.time())
     write_toggle_state(state_data, cfg)
-    log.info("milestone-toggle: injected %r into %s", cmd, pane.target)
+    log.info("milestone-toggle: injected %r into pane=%d", cmd, pane.pane_id)
 
 
 # ---------- hook socket server -------------------------------------------------
 
 async def handle_hook_event(
-    pane_id: str,
-    states: dict[str, PaneState],
+    pane_id: int,
+    states: dict[int, PaneState],
     cfg: dict[str, Any],
     dry_run: bool,
 ) -> None:
     """Stop-hook arrived. Find pane, capture once, evaluate with stable-check bypassed."""
+    log.info("hook recv pane=%d", pane_id)
     panes = discover_panes(os.getpid())
     pane = next((p for p in panes if p.pane_id == pane_id), None)
     if pane is None:
-        log.info("hook event for unknown pane %s; ignored", pane_id)
+        log.info("hook event for unknown pane %d; ignored", pane_id)
         return
     state = states.setdefault(pane.pane_id, PaneState())
     evaluate_pane(pane, state, cfg, dry_run, from_hook=True)
 
 
 async def start_socket_server(
-    states: dict[str, PaneState],
+    states: dict[int, PaneState],
     cfg: dict[str, Any],
     dry_run: bool,
 ) -> asyncio.AbstractServer | None:
+    """TCP loopback hook channel. Replaces the unix-socket transport that
+    only worked on POSIX. Bind is restricted to 127.0.0.1 to keep traffic
+    on the host's loopback interface; the connection handler additionally
+    rejects any non-loopback peer as defense-in-depth. Port is configurable
+    with auto-retry (+0..+10) when the preferred port is occupied.
+    """
     if not cfg["socket_enabled"]:
         log.info("hook socket disabled (socket_enabled=false)")
         return None
-    sock_path = resolve_socket_path(cfg)
-    path = Path(sock_path)
-    if path.exists():
-        try:
-            path.unlink()
-        except OSError as e:
-            log.warning("could not remove stale socket %s: %s", path, e)
-            return None
-    path.parent.mkdir(parents=True, exist_ok=True)
+
+    host = str(cfg["socket_host"]).strip() or "127.0.0.1"
+    want_port = int(cfg["socket_port"])
+    bound_port: int | None = None
+    server: asyncio.AbstractServer | None = None
+    last_err: OSError | None = None
 
     async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
+            peer = writer.get_extra_info("peername")
+            if peer and peer[0] not in ("127.0.0.1", "::1"):
+                log.warning("rejecting non-loopback peer: %s", peer)
+                return
             try:
                 data = await asyncio.wait_for(reader.readline(), timeout=2.0)
             except asyncio.TimeoutError:
@@ -1097,18 +1191,29 @@ async def start_socket_server(
                     msg = {"event": "stop", "pane": line}
             except json.JSONDecodeError:
                 msg = {"event": "stop", "pane": line}
-            pane_id = str(msg.get("pane", "")).strip()
-            if not pane_id:
+
+            want_token = str(cfg.get("socket_token", "")).strip()
+            got_token = str(msg.get("token", "")).strip()
+            if want_token and got_token != want_token:
+                log.warning("rejecting hook payload with token mismatch from %s", peer)
                 return
+
+            raw_pane = msg.get("pane")
+            try:
+                pane_id = int(str(raw_pane).strip().lstrip("%"))
+            except (TypeError, ValueError):
+                log.warning("invalid pane in hook payload: %r", raw_pane)
+                return
+
             try:
                 state_data = read_toggle_state(cfg)
-                entry = state_data.get("panes", {}).get(pane_id)
+                entry = state_data.get("panes", {}).get(str(pane_id))
                 if entry and entry.get("enabled"):
                     await handle_milestone_event(pane_id, states, cfg, dry_run)
                 else:
                     await handle_hook_event(pane_id, states, cfg, dry_run)
             except Exception:
-                log.exception("hook handler failed for %s", pane_id)
+                log.exception("hook handler failed for pane=%d", pane_id)
         finally:
             writer.close()
             try:
@@ -1116,23 +1221,45 @@ async def start_socket_server(
             except Exception:
                 pass
 
-    try:
-        server = await asyncio.start_unix_server(on_connect, path=str(path))
-    except OSError as e:
-        log.warning("could not bind socket %s: %s — hook channel disabled", path, e)
+    for offset in range(11):
+        candidate = want_port + offset
+        try:
+            server = await asyncio.start_server(on_connect, host=host, port=candidate)
+            bound_port = candidate
+            break
+        except OSError as e:
+            last_err = e
+            continue
+
+    if server is None or bound_port is None:
+        log.error("TCP hook server failed to bind %s:%d..%d: %s",
+                  host, want_port, want_port + 10, last_err)
         return None
+
+    info = {
+        "host": host,
+        "port": bound_port,
+        "pid": os.getpid(),
+        "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "token_required": bool(str(cfg.get("socket_token", "")).strip()),
+    }
+    info_path = socket_info_path()
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    log.info("hook socket listening at %s", path)
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = info_path.with_suffix(info_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        os.replace(tmp, info_path)
+    except OSError as e:
+        log.warning("could not write socket-info file %s: %s", info_path, e)
+
+    log.info("TCP hook server listening on %s:%d", host, bound_port)
     return server
 
 
 # ---------- main loop ----------------------------------------------------------
 
 async def main_loop(
-    states: dict[str, PaneState],
+    states: dict[int, PaneState],
     cfg: dict[str, Any],
     dry_run: bool,
     stop: asyncio.Event,
@@ -1178,11 +1305,18 @@ async def main_loop(
 
 
 async def run_daemon(cfg: dict[str, Any], dry_run: bool) -> None:
-    states: dict[str, PaneState] = {}
+    states: dict[int, PaneState] = {}
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    # loop.add_signal_handler is POSIX-only — on Windows ProactorEventLoop it
+    # raises NotImplementedError. Fall back to letting KeyboardInterrupt
+    # propagate from asyncio.run (Ctrl+C still works via Windows' default
+    # signal delivery, just without the in-loop graceful flag).
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, AttributeError, RuntimeError):
+            pass
 
     server = await start_socket_server(states, cfg, dry_run)
     try:
@@ -1194,10 +1328,12 @@ async def run_daemon(cfg: dict[str, Any], dry_run: bool) -> None:
                 await server.wait_closed()
             except Exception:
                 pass
-            try:
-                Path(resolve_socket_path(cfg)).unlink(missing_ok=True)
-            except OSError:
-                pass
+        # Clear socket-info regardless of whether server was up — stale info
+        # would cause hooks to connect-refused after daemon exit.
+        try:
+            socket_info_path().unlink(missing_ok=True)
+        except OSError:
+            pass
         log.info("watcher exiting")
 
 
@@ -1205,12 +1341,13 @@ async def run_once(cfg: dict[str, Any]) -> int:
     """Single-tick diagnostic: print discovered panes + classification, no codex."""
     panes = discover_panes(os.getpid())
     if not panes:
-        print("no claude panes found")
+        print("no wezterm panes found (is WezTerm GUI running?)")
         return 0
     for p in panes:
-        screen = capture_pane_adaptive(p.target, cfg)
+        screen = capture_pane_adaptive(p.pane_id, cfg)
         cls = classify(screen, p.title)
-        print(f"{p.target}  pane={p.pane_id}  pid={p.pid}  class={cls}  title={p.title!r}")
+        print(f"pane={p.pane_id:<4} window={p.window_id} tab={p.tab_id} "
+              f"class={cls:<8} title={p.title!r}")
     return 0
 
 

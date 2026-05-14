@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
-"""milestone-runner toggle CLI.
+"""milestone-runner toggle CLI (WezTerm + Windows).
 
 `on` / `off` flip the per-pane switch that tells the watcher daemon to inject
-`/milestone-runner` into the current tmux pane on every Stop hook event.
+`/milestone-runner` into the current WezTerm pane on every Stop hook event.
 `status` prints what is currently enabled.
 
 State file (atomic write, tmp + rename):
@@ -22,6 +21,8 @@ from pathlib import Path
 from typing import Any
 
 
+# ---------- state file paths --------------------------------------------------
+
 def state_root() -> Path:
     base = os.environ.get("XDG_STATE_HOME", "").strip()
     if base:
@@ -36,50 +37,71 @@ def state_path() -> Path:
     return state_root() / "milestone-toggle.json"
 
 
-def socket_path() -> Path:
-    explicit = os.environ.get("WATCHER_SOCKET_PATH", "").strip()
-    if explicit:
-        return Path(explicit)
-    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "default"
-    base = runtime if runtime else "/tmp"
-    return Path(f"{base}/watcher-{user}.sock")
+# ---------- TCP socket discovery ---------------------------------------------
+
+def socket_info_path() -> Path:
+    return Path.home() / ".watcher" / "socket-info.json"
 
 
-def require_pane() -> str:
-    pane = os.environ.get("TMUX_PANE", "").strip()
+def resolve_daemon_endpoint() -> tuple[str, int]:
+    host = os.environ.get("WATCHER_SOCKET_HOST", "").strip() or "127.0.0.1"
+    port_env = os.environ.get("WATCHER_SOCKET_PORT", "").strip()
+    if port_env:
+        try:
+            return host, int(port_env)
+        except ValueError:
+            pass
+    info = socket_info_path()
+    if info.exists():
+        try:
+            data = json.loads(info.read_text(encoding="utf-8"))
+            return str(data.get("host", host)), int(data.get("port", 47823))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return host, 47823
+
+
+# ---------- pane discovery (WezTerm) -----------------------------------------
+
+def require_pane() -> int:
+    pane = os.environ.get("WEZTERM_PANE", "").strip()
     if not pane:
-        sys.stderr.write("error: not in tmux ($TMUX_PANE unset)\n")
+        sys.stderr.write("error: not in WezTerm ($WEZTERM_PANE unset)\n")
         sys.exit(2)
-    return pane
-
-
-def session_window(pane: str) -> str:
     try:
-        out = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane,
-             "#{session_name}:#{window_index}.#{pane_index}"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return ""
-    return out
+        return int(pane)
+    except ValueError:
+        sys.stderr.write(f"error: $WEZTERM_PANE not an integer: {pane!r}\n")
+        sys.exit(2)
 
 
-def detect_milestone_label() -> str:
-    """Best-effort label, just for /watcher:milestone-status output. The daemon
-    does not act on this — the marker file is the truth signal."""
+def window_tab_for_pane(pane_id: int) -> str:
+    """Locate which window/tab a pane lives in via `wezterm cli list`.
+    Used as the milestone-toggle `session_window` value so the daemon can
+    auto-disable the toggle when a pane is moved between windows/tabs.
+    Returns "" if pane not found or wezterm cli unavailable.
+    """
     try:
-        out = subprocess.run(
-            ["gh", "repo", "view", "--json", "name"],
-            capture_output=True, text=True, check=False, timeout=5,
-        )
-        if out.returncode != 0:
-            return ""
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raw = subprocess.run(
+            ["wezterm", "cli", "list", "--format", "json"],
+            capture_output=True, text=True, check=True, timeout=3.0,
+        ).stdout
+        data = json.loads(raw)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, json.JSONDecodeError):
         return ""
+    if not isinstance(data, list):
+        return ""
+    for entry in data:
+        try:
+            if int(entry.get("pane_id", -1)) == pane_id:
+                return f"{int(entry.get('window_id', 0))}:{int(entry.get('tab_id', 0))}"
+        except (TypeError, ValueError):
+            continue
     return ""
 
+
+# ---------- state read/write -------------------------------------------------
 
 def read_state() -> dict[str, Any]:
     path = state_path()
@@ -106,53 +128,61 @@ def write_state(data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+# ---------- daemon liveness probe --------------------------------------------
+
 def daemon_alive() -> bool:
-    sp = socket_path()
-    if not sp.exists():
-        return False
+    """Cheap TCP probe: connect + close. Daemon's TCP handler tolerates an
+    immediate disconnect — we just want to confirm the port is listening.
+    """
+    host, port = resolve_daemon_endpoint()
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(str(sp))
-        s.close()
-        return True
-    except OSError:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except (OSError, socket.timeout):
         return False
 
+
+# ---------- subcommands ------------------------------------------------------
 
 def cmd_on(args: argparse.Namespace) -> int:
-    pane = require_pane()
+    pane_id = require_pane()
+    key = str(pane_id)  # JSON object keys must be strings
     data = read_state()
-    entry = data["panes"].get(pane, {})
+    entry = data["panes"].get(key, {})
     now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     entry.update({
         "enabled": True,
         "enabled_at": now,
-        "session_window": session_window(pane),
+        "session_window": window_tab_for_pane(pane_id),
         "milestone_label": args.milestone or entry.get("milestone_label") or "",
         "reinjects": [],
         "completed_at": None,
     })
-    data["panes"][pane] = entry
+    data["panes"][key] = entry
     write_state(data)
-    print(f"enabled for {pane}; will inject /milestone-runner on next Stop")
+    print(f"enabled for pane={pane_id}; will inject /milestone-runner on next Stop")
     if not daemon_alive():
-        print(f"warning: watcher daemon socket not reachable ({socket_path()}). "
-              f"Start it with: bash scripts/watcher-daemon.sh start", file=sys.stderr)
+        host, port = resolve_daemon_endpoint()
+        print(
+            f"warning: watcher daemon not reachable at {host}:{port}. "
+            f"Start it with: pwsh scripts\\watcher-daemon.ps1 start",
+            file=sys.stderr,
+        )
     return 0
 
 
 def cmd_off(args: argparse.Namespace) -> int:
-    pane = require_pane()
+    pane_id = require_pane()
+    key = str(pane_id)
     data = read_state()
-    entry = data["panes"].get(pane)
+    entry = data["panes"].get(key)
     if not entry or not entry.get("enabled"):
-        print(f"already off for {pane}")
+        print(f"already off for pane={pane_id}")
         return 0
     entry["enabled"] = False
     entry["disabled_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     write_state(data)
-    print(f"disabled for {pane}")
+    print(f"disabled for pane={pane_id}")
     return 0
 
 
@@ -162,24 +192,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not panes:
         print("no panes enabled")
         return 0
-    cur = os.environ.get("TMUX_PANE", "").strip()
+    cur = os.environ.get("WEZTERM_PANE", "").strip()
+    host, port = resolve_daemon_endpoint()
     print(f"state file: {state_path()}")
-    print(f"daemon socket: {'alive' if daemon_alive() else 'unreachable'} ({socket_path()})")
+    print(f"daemon: {'alive' if daemon_alive() else 'unreachable'} ({host}:{port})")
     print()
-    for pane_id, entry in sorted(panes.items()):
-        marker = "*" if pane_id == cur else " "
+    for pane_key, entry in sorted(panes.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+        marker = "*" if pane_key == cur else " "
         flag = "ON " if entry.get("enabled") else "off"
         sw = entry.get("session_window") or "?"
         ml = entry.get("milestone_label") or "-"
         ts = entry.get("enabled_at") or "-"
         n = len(entry.get("reinjects") or [])
-        print(f"{marker} {pane_id:<6} {flag}  window={sw:<14} milestone={ml:<8} "
+        print(f"{marker} pane={pane_key:<5} {flag}  window={sw:<8} milestone={ml:<8} "
               f"enabled_at={ts}  reinjects={n}")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Toggle the watcher milestone-runner re-injector for the current tmux pane")
+    p = argparse.ArgumentParser(description="Toggle the watcher milestone-runner re-injector for the current WezTerm pane")
     sub = p.add_subparsers(dest="cmd", required=True)
     p_on = sub.add_parser("on", help="enable for current pane")
     p_on.add_argument("--milestone", default="", help="optional label (cosmetic)")

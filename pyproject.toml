@@ -1,7 +1,7 @@
 [project]
 name = "watcher"
 version = "0.1.0"
-description = "Auto-respond daemon: monitors tmux panes running Claude Code and uses Codex CLI to reply to prompts."
+description = "Auto-respond daemon: monitors WezTerm panes (Windows) running Claude Code and uses Codex CLI to reply to prompts."
 requires-python = ">=3.12"
 dependencies = []
 

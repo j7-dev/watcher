@@ -10,9 +10,14 @@ per_pane_cooldown_seconds  = 30     # 同一 pane 觸發後幾秒內不再觸發
 max_responses_per_window   = 20     # killswitch：時間窗內最多回應次數 (全自動下放寬)
 response_window_minutes    = 10     # killswitch 的時間窗 (分鐘)
 
-# ---- Stop hook 通道 --------------------------------------------------------
-socket_enabled             = true   # 開啟 unix domain socket，讓 Claude Code Stop hook 即時觸發
-socket_path                = ""     # 空字串 = 用 $XDG_RUNTIME_DIR/watcher-$USER.sock (退路 /tmp)
+# ---- Stop hook 通道 (TCP loopback) ----------------------------------------
+# WezTerm/Windows 沒有 unix domain socket — daemon 在 127.0.0.1 上開 TCP server，
+# claude-stop-notify.py 透過 TCP 推 pane id。binding 限 loopback，handler 再驗
+# loopback 一次當 defense-in-depth。port 被占用會自動嘗試 +1..+10。
+socket_enabled             = true       # 整體開關
+socket_host                = "127.0.0.1"  # 通常不需要改；非 loopback 會被 handler 拒絕
+socket_port                = 47823       # daemon 啟動時實際綁定的 port 會寫到 ~/.watcher/socket-info.json
+socket_token               = ""          # 非空時 hook payload 必須帶相同 token (HMAC-style 共享祕密；多 user 環境可開)
 
 # ---- Codex CLI ------------------------------------------------------------
 codex_binary               = "codex"
@@ -36,11 +41,14 @@ skip_decision_cache_ttl_seconds = 600    # 0 = 不快取 (全自動下拉長 TTL
 skip_predictor_extra_markers    = []
 
 # ---- 畫面擷取 -------------------------------------------------------------
-# 預設抓 200 行；當畫面底部偵測到未閉合的邊框 (`╰` 多於 `╭`，例如 Plan Mode
-# 多頁 plan 框) 會自動往上補抓，每次 +escalation_step，最多到 max。
-capture_scrollback_lines        = 200    # 每次抓畫面含多少行 scrollback (初始)
+# WezTerm 對 Claude Code 的 alt-screen 通常只能拿到 viewport (~40-50 行)；
+# 設 100 起跳已足以涵蓋 classify() 最大 lookback (input 25 / menu 40 行)。
+# 當畫面底部偵測到未閉合的邊框 (`╰` 多於 `╭`，例如 Plan Mode 多頁 plan 框)
+# 會自動往上補抓，每次 +escalation_step，最多到 max；alt-screen 模式下 wezterm
+# 通常會在 viewport 邊界回相同內容並停止 escalation。
+capture_scrollback_lines        = 100    # 每次抓畫面含多少行 scrollback (初始)
 capture_escalation_step         = 400    # 偵測到邊框截斷時，每次往上加抓的行數
-max_capture_scrollback_lines    = 2000   # 自適應擷取的上限 (tmux history-limit 內)
+max_capture_scrollback_lines    = 2000   # 自適應擷取的上限
 # 送進 codex 的內容上限。先 `_clean_screen` 過濾 chrome，再 `_trim_to_current_decision`
 # 裁切：若底部是 `╰` 結尾的邊框 (plan / 權限框)，只留從對應 `╭` 起算的當前 box；
 # 否則只留最後 N 行 (純輸入框 / 純編號選單)。避免擷取上輪對話污染決策。
@@ -56,6 +64,7 @@ log_backups                = 3                                # rotate 後保留
 log_retention_days         = 0                                # >0 時，每小時清掉 logs/triggers/ 內 mtime 超過 N 天的檔；0 = 永久保留
 
 # 只把 audit triggers/*.json 與 codex-out-*.txt 限定在指定 pane (主 watcher.log
-# 仍全量寫)。空 list (預設) = 全部都記。可寫 "%18" 或 "18" 兩種寫法。
-# 環境變數 WATCHER_LOG_PANE_IDS="%18,%19" 用逗號分隔。
+# 仍全量寫)。空 list (預設) = 全部都記。WezTerm pane id 是整數；歷史 "%N" 寫法
+# 也接受 (`%` 前綴會被剝掉)。範例：[18, 19] 或 ["18", "19"] 或 ["%18", "%19"]。
+# 環境變數 WATCHER_LOG_PANE_IDS="18,19" 用逗號分隔。
 log_pane_ids               = []

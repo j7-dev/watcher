@@ -1,13 +1,14 @@
 {
   "name": "watcher",
   "version": "0.1.7",
-  "description": "tmux pane auto-responder for Claude Code — detects idle Claude prompts and asks Codex CLI how to reply",
+  "description": "WezTerm pane auto-responder for Claude Code on Windows — detects idle Claude prompts and asks Codex CLI how to reply",
   "author": {
     "name": "j7",
     "email": "info@morepower.club"
   },
   "keywords": [
-    "tmux",
+    "wezterm",
+    "windows",
     "claude-code",
     "codex",
     "automation",

@@ -1,15 +1,16 @@
 ---
-description: Stop the watcher daemon (kill the tmux session + watcher.py processes)
+description: Stop the watcher daemon (kill the WezTerm pane hosting watcher.py)
 ---
 
-Stop the watcher daemon: kill the `watcher` tmux session if present, then
-send SIGTERM to any remaining `watcher.py` processes inside that tmux
-session (SIGKILL after 1 s if they ignore the term).
+Stop the watcher daemon: tell WezTerm to kill the pane that is hosting
+`uv run watcher.py`. The watcher process exits cleanly through Python's
+asyncio finally block and removes `~/.watcher/socket-info.json` and the
+daemon-state file on its way out.
 
 Run exactly:
 
-```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/watcher-daemon.sh" stop
+```powershell
+pwsh -NoProfile -File "${CLAUDE_PLUGIN_ROOT}/scripts/watcher-daemon.ps1" stop
 ```
 
 After running:
@@ -18,9 +19,10 @@ After running:
   (the script prints `not running`). Report stdout verbatim.
 - Exit code non-zero: print the stderr output and stop.
 
-Scope: process detection is restricted to the Unix session id (SID) of the
-`watcher` tmux pane. A foreground `uv run watcher.py` launched from the
-user's own shell (outside this tmux session) will **not** be detected or
-signalled — that is intentional, so an autonomous Claude invocation of
-this command cannot kill a developer's foreground instance. If the user
-asks why a foreground watcher kept running after `stop`, explain this.
+Scope: process identification is restricted to the pane recorded in
+`$env:USERPROFILE\.watcher\daemon-state.json`. A foreground
+`uv run watcher.py` launched manually from another WezTerm pane will **not**
+be detected or killed — that is intentional, so an autonomous Claude
+invocation of this command cannot kill a developer's foreground instance.
+If the user asks why a foreground watcher kept running after `stop`,
+explain this.

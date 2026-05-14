@@ -32,10 +32,18 @@ def repo_root() -> Path:
 
 
 def default_hook_command() -> str:
+    """Hook command must invoke Python explicitly on Windows — `.py` files are
+    not directly executable from `~/.claude/settings.json` the way they are
+    on POSIX via shebang. Path is quoted so spaces in user paths
+    (e.g. `C:\\Users\\First Last\\...`) survive shell splitting.
+    """
     env = os.environ.get("WATCHER_HOOK_COMMAND", "").strip()
     if env:
         return env
-    return str(repo_root() / "hooks" / "claude-stop-notify.py")
+    hook_path = repo_root() / "hooks" / "claude-stop-notify.py"
+    # Forward slashes are accepted by Windows Python and avoid JSON-escaping
+    # backslashes in settings.json (cleaner diffs, no \\ confusion).
+    return f'python "{hook_path.as_posix()}"'
 
 
 def default_settings_path() -> Path:
@@ -106,13 +114,25 @@ def cmd_status(settings_path: Path, hook_cmd: str) -> int:
     return 0 if installed else 1
 
 
+def _extract_script_path(hook_cmd: str) -> Path | None:
+    """Pull the .py path out of a hook command like `python "C:/.../foo.py"`
+    so we can sanity-check it exists before writing the hook entry.
+    Returns None if no .py is parsable (custom command — trust the user).
+    """
+    # crude: find first .py segment
+    for seg in hook_cmd.replace('"', " ").split():
+        if seg.endswith(".py"):
+            return Path(seg)
+    return None
+
+
 def cmd_install(settings_path: Path, hook_cmd: str) -> int:
-    hook_path = Path(hook_cmd.split()[0] if " " in hook_cmd else hook_cmd)
-    if not hook_path.is_file():
-        print(f"error: hook script not found: {hook_path}", file=sys.stderr)
+    script_path = _extract_script_path(hook_cmd)
+    if script_path is not None and not script_path.is_file():
+        print(f"error: hook script not found: {script_path}", file=sys.stderr)
         return 2
-    if not os.access(hook_path, os.X_OK):
-        os.chmod(hook_path, 0o755)
+    # chmod intentionally skipped — Windows has no POSIX exec bit and the
+    # `python "..."` command form invokes the interpreter directly anyway.
 
     data = load_settings(settings_path)
     stop = stop_hook_entries(data)

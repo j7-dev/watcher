@@ -9,8 +9,8 @@ output verbatim so the user can see whether the install succeeded.
 
 Run exactly:
 
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install-hook.py" $ARGUMENTS
+```powershell
+python "${CLAUDE_PLUGIN_ROOT}/scripts/install-hook.py" $ARGUMENTS
 ```
 
 After running:

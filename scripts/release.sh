@@ -15,8 +15,15 @@ if [ ! -f "$PLUGIN_JSON" ]; then
   exit 1
 fi
 
-# Bump patch version in plugin.json (in-place, JSON-safe via python3).
-NEW_VERSION="$(python3 - "$PLUGIN_JSON" <<'PY'
+# Bump patch version in plugin.json (in-place, JSON-safe via python).
+# Use whichever python interpreter is on PATH — Windows ships `python` not
+# `python3`, while POSIX historically ships only `python3`. Fall back order.
+PY_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PY_BIN" ]; then
+  echo "[release] python (3.6+) not on PATH" >&2
+  exit 1
+fi
+NEW_VERSION="$("$PY_BIN" - "$PLUGIN_JSON" <<'PY'
 import json, sys
 path = sys.argv[1]
 with open(path, encoding="utf-8") as f:
