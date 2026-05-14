@@ -11,6 +11,19 @@ Resolution order for the WezTerm pane id:
     2. `cwd` field from the Claude Code Stop hook stdin JSON payload — used
        only as a sanity hint; without a real pane id we still no-op.
 
+Stdin payload (Claude Code writes a JSON object then closes stdin):
+    {
+        "session_id":       "<uuid>",
+        "transcript_path":  "<abs path to ~/.claude/projects/.../<sid>.jsonl>",
+        "cwd":              "<project cwd>",
+        "hook_event_name":  "Stop",
+        ...
+    }
+This hook forwards `session_id` and `transcript_path` to the daemon so the
+daemon can extract lightweight session metadata (ai-title / first & last
+last-prompt entries) and feed it to codex as disambiguation context — the
+screen remains the source of truth, the session context is supplementary.
+
 Connection target (TCP loopback, replacing the POSIX unix-socket transport):
     `$WATCHER_SOCKET_HOST`     env override, default 127.0.0.1
     `$WATCHER_SOCKET_PORT`     env override
@@ -56,6 +69,24 @@ def resolve_endpoint() -> tuple[str, int]:
     return host, DEFAULT_PORT
 
 
+def read_stdin_payload() -> dict[str, object]:
+    """Best-effort parse of Claude Code's Stop-hook stdin JSON payload.
+    Returns {} on any error — hooks must NEVER block a turn, and the daemon
+    still works fine when transcript metadata is absent.
+    """
+    try:
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    if not raw or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def main() -> int:
     pane_raw = os.environ.get("WEZTERM_PANE", "").strip()
     if not pane_raw:
@@ -65,8 +96,16 @@ def main() -> int:
     except ValueError:
         return 0
 
+    stdin_payload = read_stdin_payload()
+    transcript_path = str(stdin_payload.get("transcript_path") or "").strip()
+    session_id = str(stdin_payload.get("session_id") or "").strip()
+
     host, port = resolve_endpoint()
     payload: dict[str, object] = {"v": 1, "event": "stop", "pane": pane_id}
+    if transcript_path:
+        payload["transcript_path"] = transcript_path
+    if session_id:
+        payload["session_id"] = session_id
     token = os.environ.get("WATCHER_SOCKET_TOKEN", "").strip()
     if token:
         payload["token"] = token

@@ -42,8 +42,10 @@ PROMPT_TEMPLATE = """\
 action。
 
 ═══ 三條根本約束 ═══
-1. **純函式**：你無前後記憶，所有判斷只能來自下方畫面。
-2. **螢幕為唯一真實**：畫面看不到的就是不知道；不可腦補細節。
+1. **無前後記憶**：除下方畫面與可選的 session 脈絡外，你不知道任何事；
+   不可腦補。
+2. **螢幕為唯一真實**：畫面看不到的就是不知道；session 脈絡只能用於
+   消歧義（例如理解使用者意圖），與畫面衝突時以畫面為準，不可蓋過畫面。
 3. **行動代價不對稱**：錯 `skip` 讓使用者下輪自處理（小代價）；錯
    `text`/`key` 可能觸發不可逆操作（大代價）。模糊時偏 skip，
    **但畫面明顯有等待答案的問題時，請優先給答案而非 skip。**
@@ -89,7 +91,12 @@ action。
 - **計畫被截斷**：Plan Mode 可見 `╰` 收尾卻看不到對應 `╭` 起頭 →
   「No, keep planning」而非盲核准。
 
---- 畫面擷取（介於圍欄之間） ---
+═══ Session 脈絡使用規則（若下方提供 Session 脈絡區段） ═══
+脈絡僅供消歧義（例：判斷 user 是否在 mid-compose、編號選單該選哪項
+最符合使用者意圖）。脈絡可能 stale（已換主題、清過 history）；與畫面
+不一致時直接忽略脈絡，不可因脈絡偏離畫面內容。
+
+{session_context}--- 畫面擷取（介於圍欄之間） ---
 ```
 {screen}
 ```
@@ -214,8 +221,19 @@ def predict_skip(
     return f"no question marker in last {len(window)} non-empty line(s)"
 
 
-def _screen_hash(clean_screen: str) -> str:
-    return hashlib.sha256(clean_screen.encode("utf-8")).hexdigest()
+def _screen_hash(clean_screen: str, context: str = "") -> str:
+    """Hash key for the decision cache. Optional `context` (e.g. user's current
+    Claude Code prompt) is mixed in so identical screens belonging to different
+    user requests do not share a skip decision — the codex answer for the same
+    visual prompt can legitimately differ when the user's intent differs.
+    Empty context preserves the original screen-only hash for pre-session-meta
+    callers / polling-only panes."""
+    h = hashlib.sha256()
+    h.update(clean_screen.encode("utf-8"))
+    if context:
+        h.update(b"\x1f")  # ASCII unit separator — safe delimiter, never in text
+        h.update(context.encode("utf-8"))
+    return h.hexdigest()
 
 
 def _cache_lookup(key: str, now: float) -> dict[str, Any] | None:
@@ -547,6 +565,12 @@ class PaneState:
     disabled: bool = False
     in_flight: bool = False
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    # Latest Claude Code transcript path learned from a Stop-hook stdin
+    # payload. Used by extract_session_meta() to enrich the codex prompt
+    # with ai-title / last-prompt context. Polling-only panes (no hook
+    # event ever received) leave this None and run with screen-only prompts.
+    # Daemon restart loses this — re-populated on the next Stop hook.
+    transcript_path: str | None = None
 
 
 # ---------- wezterm helpers ----------------------------------------------------
@@ -969,14 +993,120 @@ def evaluate_pane(
     return True
 
 
+# ---------- session metadata extraction ----------------------------------------
+#
+# Claude Code writes one JSONL line per turn into
+#   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+# alongside the rolling conversation. Three lightweight metadata entry types
+# carry user intent in a few hundred bytes (vs raw turns which run into 100K+
+# tokens) and are safe to surface to codex as disambiguation context:
+#
+#   {"type":"ai-title",    "aiTitle":"<one-line topic>",      ...}
+#   {"type":"last-prompt", "lastPrompt":"<user's current msg>", ...}
+#   {"type":"summary",     "summary":"<post-/compact summary>", ...}   (rare)
+#
+# `ai-title` and `last-prompt` are rewritten every turn; the first `last-prompt`
+# in the file is therefore the user's initial request, the final one is the
+# current request. Forward-scan O(n) is acceptable — files rarely exceed a few
+# MB. Failure modes are all "return None" — codex still works on screen alone.
+
+_MAX_META_FIELD = 800  # per-field char cap to bound prompt size & redact long pastes
+
+
+def extract_session_meta(transcript_path: str | None) -> dict[str, str] | None:
+    """Best-effort extraction of lightweight Claude Code session metadata.
+
+    Returns a dict with string fields (any may be empty):
+        title             — latest ai-title.aiTitle (one-line topic, AI-named)
+        initial_request   — first  last-prompt.lastPrompt
+        current_request   — latest last-prompt.lastPrompt
+        summary           — latest summary.summary (only after /compact)
+
+    Returns None when the path is missing/unreadable/empty of metadata.
+    """
+    if not transcript_path:
+        return None
+    p = Path(transcript_path)
+    if not p.is_file():
+        return None
+    title = ""
+    initial_request = ""
+    current_request = ""
+    summary = ""
+    try:
+        with p.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                t = d.get("type")
+                if t == "ai-title":
+                    v = d.get("aiTitle")
+                    if isinstance(v, str) and v.strip():
+                        title = v.strip()
+                elif t == "last-prompt":
+                    v = d.get("lastPrompt")
+                    if isinstance(v, str) and v.strip():
+                        s = v.strip()
+                        if not initial_request:
+                            initial_request = s
+                        current_request = s
+                elif t == "summary":
+                    v = d.get("summary")
+                    if isinstance(v, str) and v.strip():
+                        summary = v.strip()
+    except OSError as e:
+        log.warning("extract_session_meta: %s unreadable: %s", p, e)
+        return None
+    if not (title or initial_request or current_request or summary):
+        return None
+    return {
+        "title": title[:_MAX_META_FIELD],
+        "initial_request": initial_request[:_MAX_META_FIELD],
+        "current_request": current_request[:_MAX_META_FIELD],
+        "summary": summary[:_MAX_META_FIELD],
+    }
+
+
+def _format_session_context(meta: dict[str, str] | None) -> str:
+    """Render meta dict into the `{session_context}` placeholder for
+    PROMPT_TEMPLATE. Empty string means no context block — the template's
+    surrounding usage-rule paragraph still renders but is a no-op for codex.
+    """
+    if not meta:
+        return ""
+    parts = ["═══ Session 脈絡（參考用，畫面仍為唯一真實） ═══"]
+    if meta.get("title"):
+        parts.append(f"主題：{meta['title']}")
+    initial = meta.get("initial_request", "")
+    current = meta.get("current_request", "")
+    if initial:
+        parts.append(f"最初需求：{initial}")
+    if current and current != initial:
+        parts.append(f"當前需求：{current}")
+    if meta.get("summary"):
+        parts.append(f"摘要：{meta['summary']}")
+    return "\n".join(parts) + "\n\n"
+
+
 # ---------- codex invocation ---------------------------------------------------
 
-def build_prompt(screen: str, cfg: dict[str, Any]) -> str:
+def build_prompt(
+    screen: str,
+    cfg: dict[str, Any],
+    session_meta: dict[str, str] | None = None,
+) -> str:
     cleaned = _clean_screen(screen)
     fallback = int(cfg.get("prompt_context_lines", 60))
     trimmed = _trim_to_current_decision(cleaned, fallback)
     stripped = _strip_input_box_tail(trimmed)
-    return PROMPT_TEMPLATE.format(screen=stripped)
+    return PROMPT_TEMPLATE.format(
+        screen=stripped,
+        session_context=_format_session_context(session_meta),
+    )
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
@@ -1160,9 +1290,18 @@ async def handle_pane(
         async with state.lock:
             log.info("trigger %s class=%s title=%r", pane.pane_id, state.last_classification, pane.title)
 
+            # Best-effort: enrich the codex prompt with Claude Code session
+            # metadata (title + initial/current user request) when we have a
+            # transcript_path from a recent Stop-hook payload. None on
+            # polling-only panes — codex falls back to screen-only reasoning.
+            session_meta = extract_session_meta(state.transcript_path)
+
             # Pre-codex short-circuits: cache hit, then heuristic skip predictor.
+            # Mix current_request into the cache key so the same visual prompt
+            # under different user intents does not share a skip decision.
             clean = _clean_screen(snapshot)
-            shash = _screen_hash(clean)
+            cache_context = (session_meta or {}).get("current_request", "")
+            shash = _screen_hash(clean, cache_context)
             cache_ttl = float(cfg["skip_decision_cache_ttl_seconds"])
             cooldown = float(cfg["per_pane_cooldown_seconds"])
             pre_now = time.time()
@@ -1194,7 +1333,7 @@ async def handle_pane(
                         log.exception("audit write failed")
                     return
 
-            codex_prompt = build_prompt(snapshot, cfg)
+            codex_prompt = build_prompt(snapshot, cfg, session_meta=session_meta)
             try:
                 decision = await call_codex(pane, codex_prompt, cfg)
             except Exception as e:
@@ -1392,8 +1531,16 @@ async def handle_hook_event(
     states: dict[int, PaneState],
     cfg: dict[str, Any],
     dry_run: bool,
+    transcript_path: str | None = None,
 ) -> None:
-    """Stop-hook arrived. Find pane, capture once, evaluate with stable-check bypassed."""
+    """Stop-hook arrived. Find pane, capture once, evaluate with stable-check bypassed.
+
+    transcript_path is the Claude Code session JSONL forwarded by the hook
+    script from its stdin payload. Stored on PaneState so subsequent poll
+    ticks for the same pane can also enrich the codex prompt (best-effort —
+    may go stale if user switches sessions; safe because screen-truth rule
+    overrides any context mismatch).
+    """
     log.info("hook recv pane=%d", pane_id)
     panes = discover_panes(os.getpid())
     pane = next((p for p in panes if p.pane_id == pane_id), None)
@@ -1401,6 +1548,8 @@ async def handle_hook_event(
         log.info("hook event for unknown pane %d; ignored", pane_id)
         return
     state = states.setdefault(pane.pane_id, PaneState())
+    if transcript_path:
+        state.transcript_path = transcript_path
     evaluate_pane(pane, state, cfg, dry_run, from_hook=True)
 
 
@@ -1458,13 +1607,18 @@ async def start_socket_server(
                 log.warning("invalid pane in hook payload: %r", raw_pane)
                 return
 
+            transcript_path = str(msg.get("transcript_path") or "").strip() or None
+
             try:
                 state_data = read_toggle_state(cfg)
                 entry = state_data.get("panes", {}).get(str(pane_id))
                 if entry and entry.get("enabled"):
                     await handle_milestone_event(pane_id, states, cfg, dry_run)
                 else:
-                    await handle_hook_event(pane_id, states, cfg, dry_run)
+                    await handle_hook_event(
+                        pane_id, states, cfg, dry_run,
+                        transcript_path=transcript_path,
+                    )
             except Exception:
                 log.exception("hook handler failed for pane=%d", pane_id)
         finally:
