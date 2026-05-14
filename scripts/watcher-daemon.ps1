@@ -189,22 +189,49 @@ function Invoke-Start {
 
 function Invoke-Stop {
     $state = Get-DaemonState
-    if (-not $state) {
-        Write-Host "not running (no state file)"
-        return 0
+    $paneKilled = $false
+
+    # Step 1: if state file points to a live pane, kill that pane (graceful path).
+    if ($state -and (Test-DaemonAlive -State $state)) {
+        try {
+            wezterm cli kill-pane --pane-id $state.pane_id 2>&1 | Out-Null
+            $paneKilled = $true
+        } catch {
+            Write-Warning ("wezterm cli kill-pane failed: {0}" -f $_.Exception.Message)
+        }
     }
-    if (-not (Test-DaemonAlive -State $state)) {
-        Write-Host "not running (stale state cleared)"
-        Remove-DaemonState
-        return 0
+
+    # Step 2: sweep all orphan python procs running `watcher.py`. Multiple
+    # restarts where state went out of sync with reality can strand prior
+    # daemons; this catch-all guarantees no zombie writes config-cached audit
+    # files after `stop`. Skip filtering by repo path so cache-dir launches
+    # also get cleaned (CommandLine on Windows includes the script path).
+    $orphans = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -like '*watcher.py*' })
+    foreach ($p in $orphans) {
+        try {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+            Write-Host ("killed orphan python pid={0}" -f $p.ProcessId)
+        } catch {
+            Write-Warning ("could not kill pid={0}: {1}" -f $p.ProcessId, $_.Exception.Message)
+        }
     }
-    try {
-        wezterm cli kill-pane --pane-id $state.pane_id 2>&1 | Out-Null
-    } catch {
-        Write-Warning ("wezterm cli kill-pane failed: {0}" -f $_.Exception.Message)
-    }
+
+    # Step 3: clear bookkeeping files so the next `start` has a clean slate.
     Remove-DaemonState
-    Write-Host ("stopped (pane_id={0})" -f $state.pane_id)
+    Remove-Item (Join-Path $env:USERPROFILE ".watcher\socket-info.json") -Force -ErrorAction SilentlyContinue
+
+    if (-not $state -and $orphans.Count -eq 0) {
+        Write-Host "not running (no state file, no orphans)"
+        return 0
+    }
+    if ($paneKilled) {
+        Write-Host ("stopped (pane_id={0}, orphans={1})" -f $state.pane_id, $orphans.Count)
+    } elseif ($state) {
+        Write-Host ("stopped (stale state cleared, orphans={0})" -f $orphans.Count)
+    } else {
+        Write-Host ("stopped (no state file, orphans={0})" -f $orphans.Count)
+    }
     return 0
 }
 
