@@ -1,6 +1,6 @@
 # watcher
 
-監聽 **Windows 上 WezTerm** 裡所有跑 Claude Code 的 pane，偵測到「等使用者輸入」時把畫面餵給 Codex CLI 決定怎麼回，再 `wezterm cli send-text` 送答案回去。
+監聽 **Windows 上 WezTerm** 裡所有跑 Claude Code 的 pane，偵測到「等使用者輸入」時把畫面餵給 Codex CLI 決定怎麼回，再 `wezterm cli send-text` 送答案回去
 
 ```
                         ┌─► Claude Code Stop hook ─► TCP loopback ─► watcher ─┐
