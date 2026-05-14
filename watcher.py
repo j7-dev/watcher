@@ -1858,6 +1858,8 @@ def cli_entry() -> None:
     ap.add_argument("--dry-run", action="store_true", help="full loop but skip send-keys")
     args = ap.parse_args()
     cfg = load_config()
+    if args.once:
+        cfg["log_enabled"] = True
     setup_logging(cfg)
     if args.once:
         sys.exit(asyncio.run(run_once(cfg, dry_run=args.dry_run)))
