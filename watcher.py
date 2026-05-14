@@ -56,8 +56,14 @@ action。
 - `❯ <文字>`   → 底部 input box cursor + **未送出的草稿**（罕見；可能是上輪
   自動化已 type 但 Enter 未送的 stale state）。
 - `❯ <數字>.` → 編號選單 cursor，顯示目前 default 選項。
+- `<數字>. <文字>` / `<數字>) <文字>`（line-leading **裸數字**，無 `❯` 前綴）
+  → conversation 內文的編號列表 / 條列說明，**不是** 互動 menu。即使該行
+  含 `?`，那也是內文的 rhetorical question 而非等 user 作答。**不可送
+  `key` / `enter`**——畫面只是列舉/描述，不需 user 動作。
 - 空 input box（`❯ ` + 空白 + 兩條水平線包夾）已被預處理移除，畫面看不到時
   代表 input box 是空的、等待新輸入。
+- 開頭出現 `[…上文略]` 表示畫面已從中段截斷，**不可**用「畫面看不到 X」
+  反推「X 不存在」；對被截斷的脈絡保持保守。
 
 ═══ 5W1H 推理流程（內部依序回答後才產 action） ═══
 - **What**：畫面尾段屬哪一類？編號選單 / 自由文字輸入框 / 純訊息 / 純閒置。
@@ -66,6 +72,12 @@ action。
   （可能上輪自動化已 type 但 Enter 未送的 stale state）。
 - **Where**：游標 `❯` 落在哪一行？編號選項上、還是 input box 草稿上？
 - **Why**：往上掃畫面，提示在問什麼？權限／確認／計畫核准／自由回答？
+  **區分**：Claude **自宣告下一步**（"下一步建議：..."、"接下來會..."、
+  "下一步是..."、"我會繼續..." → 陳述句，**不需 user 動作**，判
+  `skip` value=`idle`）vs **徵詢核准**（"要繼續嗎？"、"是否進行？"、
+  "Y/n?"、"Press 1..."、"請選擇..." → 真問句，判 `enter` / `key` /
+  `text`）。陳述句中含 `?` 的（如內文編號列表 `1. ...?`）也算自宣告，
+  不視為徵詢。
 - **How**：對照下方決策表選 action。
 
 ═══ Action schema（value 必填，不適用填 null） ═══
@@ -125,9 +137,9 @@ DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
     "do you", "would you", "shall i", "should i",
     "continue", "confirm", "proceed", "approve",
     "press", "choose", "select", "pick",
-    "y/n", "yes/no", "(y/n)", "yes", "Yes"
+    "y/n", "yes/no", "(y/n)", "yes",
     "是否", "要不要", "請選", "請輸入", "請問", "確認",
-    "下一步", "要嗎", "要嘛",
+    "要嗎", "要嘛",
 )
 NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
 
@@ -172,6 +184,7 @@ _STATUSLINE_RE = re.compile(r"📂")               # status line: model badge/di
 _FOOTER_RE     = re.compile(r"^\s*⏵⏵\s+(bypass|auto-accept)")  # bottom mode hint
 _BAKED_RE      = re.compile(r"^\s*\S\s+\S.*?(?:[…\.]+\s*\(\d|\s+for\s+\d+\s*[ms])")  # spinner status: "✻ Sautéed for 6m 53s" / "✶ Nebulizing… (24m 54s · ...)" / "✻ Scaffolding monorepo root… (1h 2m 44s · ...)"
 _TOKEN_RE      = re.compile(r"^\s*\d+\s+tokens\s*$")            # `114738 tokens` line
+_RECAP_RE      = re.compile(r"^\s*※\s*recap", re.IGNORECASE)    # Claude self-injected `※ recap: ...` summary block
 
 
 def _clean_screen(screen: str) -> str:
@@ -184,7 +197,19 @@ def _clean_screen(screen: str) -> str:
                 start = i + 1
                 break
     kept = []
+    in_recap = False
     for l in lines[start:]:
+        # `※ recap: ...` is Claude's self-injected context summary block,
+        # spanning the recap line + any indented continuation until a blank
+        # line. Drop the whole block so codex isn't double-fed context (the
+        # daemon already passes session meta separately).
+        if not in_recap and _RECAP_RE.match(l):
+            in_recap = True
+            continue
+        if in_recap:
+            if not l.strip():
+                in_recap = False
+            continue
         if _STATUSLINE_RE.search(l):
             continue
         if _FOOTER_RE.match(l):
@@ -215,19 +240,41 @@ def predict_skip(
 ) -> str | None:
     """Return a reason string when we predict codex would answer `skip`,
     otherwise None. Only fires for `input` classification — `menu` screens
-    always carry numbered choices so they are answerable."""
+    always carry numbered choices so they are answerable.
+
+    Per-line marker check: bare numbered list lines (`1. text` / `1) text`
+    with NO `❯` prefix) are conversation-content enumeration, not interactive
+    menus — classifier already ruled out menu when classification == "input"
+    (real menus carry `❯ \\d.` cursor at the tail). A `?` inside such a line
+    is therefore a rhetorical content question, not a live prompt. Skipping
+    marker check on those lines avoids forcing a codex round-trip every time
+    Claude lists numbered open-questions in its narration.
+    """
     if classification != "input":
         return None
     nonempty = [l for l in clean_screen.splitlines() if l.strip()]
     if not nonempty:
         return "empty cleaned screen"
     window = nonempty[-max(lookback, 1):]
-    haystack = "\n".join(window).lower()
-    if any(m in haystack for m in markers):
-        return None
-    if any(NUMBERED_LIST_RE.match(l) for l in window):
-        return None
-    return f"no question marker in last {len(window)} non-empty line(s)"
+    for line in window:
+        stripped = line.lstrip()
+        # Skip non-question lines: bare numbered content (rhetorical `?` in
+        # internal lists), queued user-drafts (`｜` prefix — user's typing,
+        # not Claude's question), input-box cursor / draft / menu cursor
+        # (`❯` — handled by classifier, the cursor symbol itself isn't a
+        # question), and horizontal rules.
+        if NUMBERED_LIST_RE.match(line):
+            continue
+        if stripped.startswith(QUEUE_MARKER):
+            continue
+        if stripped.startswith("❯"):
+            continue
+        if is_hr_line(line):
+            continue
+        line_lc = line.lower()
+        if any(m in line_lc for m in markers):
+            return None
+    return f"no live question marker in last {len(window)} non-empty line(s)"
 
 
 def _screen_hash(clean_screen: str, context: str = "") -> str:
@@ -1173,6 +1220,12 @@ def build_prompt(
     cleaned = _clean_screen(screen)
     fallback = int(cfg.get("prompt_context_lines", 60))
     trimmed = _trim_to_current_decision(cleaned, fallback)
+    # If trimming dropped leading context (both `╭` head-detect and
+    # fallback last-N paths keep the tail), prepend a marker so codex
+    # knows the head was sliced — prevents "I don't see X above ⇒ X
+    # doesn't exist" false reasoning.
+    if trimmed and trimmed != cleaned and cleaned.endswith(trimmed):
+        trimmed = "[…上文略]\n" + trimmed
     rewritten = _rewrite_conversation_user_prefix(trimmed)
     stripped = _strip_input_box_tail(rewritten)
     return PROMPT_TEMPLATE.format(
