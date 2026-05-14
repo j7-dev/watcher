@@ -1,6 +1,6 @@
 {
   "name": "watcher",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "WezTerm pane auto-responder for Claude Code on Windows — detects idle Claude prompts and asks Codex CLI how to reply",
   "author": {
     "name": "j7",
