@@ -22,6 +22,21 @@ socket_token               = ""          # 非空時 hook payload 必須帶相�
 codex_binary               = "codex"
 codex_timeout_seconds      = 90     # codex exec 單次最長等待
 
+# ---- 安全閘（窄門 / 不可逆動作 skip） ------------------------------------
+# 預設 true：codex 看到 narrative 含「不可逆關鍵字」(rm / drop / force / push /
+# merge / publish / release / 刪除 / 砍掉 / DROP TABLE / reset --hard / 推送 ...)
+# 或用戶窄門標籤（`窄門 (a)/(b)/(c)` / `不可逆操作` / `irreversible`）時，回 skip
+# value=`dangerous-narrative` 讓使用者自己決定。
+# 設 false 進入全自動：上述情境也照常給 action（text / key / keys / enter）。
+# **不受此 flag 影響的正確性 guard**（永遠開）：
+#   - 機密問詢 skip（畫面要求密碼／API key／個資）
+#   - `❯ <已有文字>` 場景禁 text（append 不是 replace，會串成亂碼）
+#   - UI 不清楚 skip（footer 無提示、stage 算不準）
+#   - 多步按鍵序列上限 10 tokens
+#   - 滿意度問卷 / TUI modal skip
+# 環境變數：WATCHER_SAFETY_GATE_ENABLED=false
+safety_gate_enabled        = true
+
 # ---- 預測 skip / 決策快取 (省 token) -------------------------------------
 # 兩道便宜的前置過濾，避免畫面明顯不需要回答時還呼叫 Codex：
 #   1) decision cache：codex 一旦回 skip，把 (清理後畫面 hash → 決策) 存進記憶體，

@@ -40,7 +40,7 @@ PROMPT_TEMPLATE_LEGACY = """\
 你是 Claude Code 終端 pane 的自動回應決策代理人。每次呼叫你會收到一張
 靜態畫面快照，pane 已閒置數秒。你的任務：以符合 schema 的 JSON 回一個
 action。
-
+{safety_override}
 ═══ 三條根本約束 ═══
 1. **無前後記憶**：除下方畫面與可選的 session 脈絡外，你不知道任何事；
    不可腦補。
@@ -193,7 +193,7 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
 PROMPT_TEMPLATE_AUTONOMOUS = """\
 你是 Claude Code 終端 pane 的**自主 TUI 操作代理**。每次呼叫你會收到一張
 靜態畫面快照（pane 已閒置數秒），以符合 schema 的 JSON 回**一個** action。
-
+{safety_override}
 ═══ 三條根本約束 ═══
 1. **無前後記憶**：除下方畫面與 session 脈絡外，你不知道任何事；不可腦補。
 2. **螢幕為唯一真實**：畫面看不到的就是不知道；session 脈絡只能消歧義，
@@ -564,6 +564,14 @@ DEFAULTS: dict[str, Any] = {
     # "legacy" uses the original hardcoded decision table. Switch via
     # `prompt_mode = "legacy"` in config.toml or WATCHER_PROMPT_MODE=legacy.
     "prompt_mode": "autonomous",
+    # Safety gate: when true (default), the prompt instructs codex to `skip`
+    # on irreversible-keyword narratives (rm / drop / force / push / merge /
+    # release / etc.) and the user-narrowed-door labels (`窄門 (a)/(b)/(c)`,
+    # `不可逆操作`, `irreversible`). Set to false for full-auto mode where
+    # codex answers on those screens too. Correctness guards (secret prompts,
+    # ❯ already-filled append-bug, unclear-UI, sequence cap, survey modal)
+    # are NOT toggled by this flag — they stay on either way.
+    "safety_gate_enabled": True,
     "hr_min_length": 50,
     "socket_enabled": True,
     "socket_host": "127.0.0.1",
@@ -1503,6 +1511,37 @@ def _format_session_context(meta: dict[str, str] | None) -> str:
 
 # ---------- codex invocation ---------------------------------------------------
 
+# Override block injected at the top of the prompt when the user has opted out
+# of the "skip on irreversible / dangerous-narrative" safety gate via
+# `safety_gate_enabled = false`. LLM precedence: top-of-prompt explicit override
+# beats hardcoded rules later in the template, so we keep the existing safety
+# sections in place (no template surgery) and just neutralise the relevant rules.
+# Correctness guards (secret prompts, append-vs-replace, unclear UI, sequence
+# cap, survey modal) stay in force — they are not user-gating policy.
+SAFETY_GATE_OFF_OVERRIDE = """
+═══ ⚠️ 用戶授權：全自動模式（safety_gate_enabled=false） ═══
+用戶已在 config.toml 顯式設定 `safety_gate_enabled = false`，授權 codex 在不可逆
+與外部發布類動作上也照常自動回應。下方規則一律失效（請忽略 → 改回正常決策）：
+
+- 「不可逆關鍵字 / dangerous-narrative」（rm / drop / force / 刪除 / 砍掉 /
+  DROP TABLE / reset --hard / 強推 / --force-push / truncate / push / publish /
+  deploy / release / merge / gh pr create / gh issue create / npm publish / 推送 /
+  推 repo / 推上去 等等）→ 不再因關鍵字 skip，依畫面正常給 action。
+- 「窄門 (a) / 窄門 (b) / 窄門 (c) / 不可逆操作 / irreversible」narrative 標籤 →
+  視為一般 narrative，不因標籤本身 skip。
+- 「計畫被截斷 → No, keep planning」的保守反射 → 改依畫面提示正常決策（例如
+  畫面明示 1=Yes proceed / 2=No keep planning，依當前 ❯ 游標項 enter 即可）。
+
+**仍保留**（這些是正確性 guard、不是窄門政策）：
+- 機密問詢 skip（密碼／API key／個資畫面要求 → `skip` value=`needs-secret`）
+- `❯ <已有文字>` 場景禁 text（append 不是 replace → 仍 `enter` 或 `skip`）
+- UI 不清楚 skip（footer 無提示、stage 算不準 → 仍 `skip` value=`unclear-ui`）
+- 序列上限 10 tokens（超過仍 `skip` value=`sequence-too-long`）
+- 滿意度問卷 / TUI modal skip（仍 `skip` value=`survey-modal`）
+
+"""
+
+
 def build_prompt(
     screen: str,
     cfg: dict[str, Any],
@@ -1521,9 +1560,11 @@ def build_prompt(
     stripped = _strip_input_box_tail(rewritten)
     mode = str(cfg.get("prompt_mode", "autonomous")).strip().lower()
     template = PROMPT_TEMPLATE_LEGACY if mode == "legacy" else PROMPT_TEMPLATE_AUTONOMOUS
+    safety_override = "" if bool(cfg.get("safety_gate_enabled", True)) else SAFETY_GATE_OFF_OVERRIDE
     return template.format(
         screen=stripped,
         session_context=_format_session_context(session_meta),
+        safety_override=safety_override,
     )
 
 

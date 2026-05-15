@@ -118,6 +118,24 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 
 **為何不全改成 autonomous 砍 legacy**：autonomous 對既有穩定 case（一般編號選單、純 narrative 推進）可能 regress，保 legacy 作 escape hatch；確認 autonomous 在你環境穩定後再考慮刪。改 prompt 時兩個 template 都改、別只改一邊。
 
+### 安全閘開關（`safety_gate_enabled`）
+
+`build_prompt` 依 `cfg["safety_gate_enabled"]` 決定是否在 prompt 開頭注入 `SAFETY_GATE_OFF_OVERRIDE` 區塊：
+
+- **`true`（預設）**：不注入 override；codex 照 template 內既有的安全閘規則做事——narrative 含「不可逆關鍵字」(rm / drop / force / push / merge / publish / 刪除 / 砍掉 / DROP TABLE / reset --hard / 推送 ...) 或用戶窄門標籤（`窄門 (a)/(b)/(c)` / `不可逆操作` / `irreversible`）一律 `skip` value=`dangerous-narrative`；計畫被截斷的 Plan Mode 偏 `No, keep planning`。
+- **`false`（全自動）**：在 prompt 首段注入 override，明確告訴 codex 上述規則作廢、依畫面正常給 action。設定方式：`config.toml` 寫 `safety_gate_enabled = false` 或 `WATCHER_SAFETY_GATE_ENABLED=false uv run watcher.py`。
+
+**永遠不受 flag 影響**（這些是正確性 guard 而非用戶窄門政策，override 區塊也明示保留）：
+- 機密問詢 skip（密碼／API key／個資）
+- `❯ <已有文字>` 場景禁 `text`（send-text append 不是 replace，會串成亂碼）
+- UI 不清楚 skip（footer 無提示、stage 算不準）
+- 多步按鍵序列上限 10 tokens
+- 滿意度問卷 / TUI modal skip（classify 已 short-circuit，這條是 fallback）
+
+**為何用 override 注入而不直接重寫 safety section**：兩份 template 都有「安全閘」章節（autonomous: section C；legacy: section 安全閘），加上散落於 narrative 規則裡的 inline 提及。LLM 對 prompt 開頭的顯式 override 優先級高於後段硬寫規則，注入 override 比同步刪改兩個 template 的多處片段更低風險、也方便將來再加 flag。
+
+實作：placeholder `{safety_override}` 出現在兩個 template 最頂端（緊接 prompt 起首三行說明），`build_prompt` 視 cfg 填入 `SAFETY_GATE_OFF_OVERRIDE` 或空字串。改 template 時請保留這個 placeholder。
+
 ### Action 套用（`apply_action`）
 
 在 send-text 前**再抓一次畫面**和 baseline 比對，不同就回 `aborted-pane-changed`，防止 codex 思考期間人為操作被覆蓋。`action`：
