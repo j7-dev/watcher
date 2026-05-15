@@ -186,7 +186,7 @@ DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
     "怎麼樣", "如何",
     "告訴我", "讓我知道",
     "繼續嗎", "開始嗎",
-    "選哪", "選擇",
+    "選哪", "選擇", "選一個", "哪一個"
 
     # 下一步
     "下一", "接下來", "後續", "for future", "remaining", "剩下", "剩餘", "next round", "follow-up", "follow up"
