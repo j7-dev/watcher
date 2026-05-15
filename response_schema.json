@@ -7,12 +7,12 @@
   "properties": {
     "action": {
       "type": "string",
-      "enum": ["text", "key", "enter", "skip"],
+      "enum": ["text", "key", "enter", "skip", "keys"],
       "description": "What to do in the Claude pane."
     },
     "value": {
       "type": ["string", "null"],
-      "description": "For action=text: the reply text. For action=key: a single digit '1'-'9'. For action=skip: a short reason. null for action=enter."
+      "description": "For action=text: the reply text. For action=key: a single digit '1'-'9'. For action=keys: comma-separated key tokens (enter, tab, up, down, left, right, esc), e.g. 'down,down,enter' — max 10 tokens. For action=skip: a short reason. null for action=enter."
     }
   }
 }
