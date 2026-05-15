@@ -164,6 +164,7 @@ DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
     "y/n", "yes/no", "(y/n)", "yes",
     "是否", "要不要", "請選", "請輸入", "請問", "確認",
     "要嗎", "要嘛",
+		"下一步", "for future", "接下來"
 )
 NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
 
@@ -378,7 +379,7 @@ DEFAULTS: dict[str, Any] = {
     # resume that types `rate_limit_resume_text` after the reset time passes.
     "rate_limit_detection_enabled": True,
     "rate_limit_resume_text": "繼續",
-    "rate_limit_resume_buffer_seconds": 60,
+    "rate_limit_resume_buffer_seconds": 10,
     "rate_limit_max_wait_hours": 26,
     "rate_limit_tz_fallback": "Asia/Taipei",
 }
@@ -1121,13 +1122,24 @@ def evaluate_pane(
     Returns True if a handler was scheduled."""
     screen = capture_pane_adaptive(pane.pane_id, cfg)
     if not screen:
+        log.debug("evaluate pane=%d capture empty", pane.pane_id)
         return False
     classification = classify(screen)
     state.last_classification = classification
+    src = "hook" if from_hook else "poll"
     if not should_trigger(state, classification, cfg):
+        # Log skipped panes at INFO so missing/non-triggering panes are
+        # observable without enabling DEBUG. Cheap (<200 panes typical) and
+        # essential for diagnosing "why didn't pane N fire" complaints.
+        now = time.time()
+        cd_left = max(0.0, state.cooldown_until - now)
+        log.info(
+            "evaluate pane=%d class=%s src=%s — skip (disabled=%s in_flight=%s cd_left=%.1fs win=%d)",
+            pane.pane_id, classification, src,
+            state.disabled, state.in_flight, cd_left, len(state.responses_in_window),
+        )
         return False
     state.in_flight = True
-    src = "hook" if from_hook else "poll"
     log.info("evaluate pane=%d class=%s src=%s — scheduling handler", pane.pane_id, classification, src)
     asyncio.create_task(handle_pane(pane, state, screen, cfg, dry_run))
     return True
@@ -1547,16 +1559,42 @@ def _parse_reset_time(screen: str, tz_fallback: str) -> float | None:
             if idx == 1:  # "tomorrow"
                 d = (now + dt.timedelta(days=1)).date()
                 return dt.datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz).timestamp()
-            # bare time
+            # bare time form ("resets 1:10am"). Claude Code shows this without
+            # an explicit date and does NOT auto-refresh after the reset, so by
+            # the time the daemon polls we may already be past the reset
+            # instant. Two cases:
+            #   (a) parsed time is in the future today  → use it as-is
+            #   (b) parsed time is in the past today    → reset already happened;
+            #       treat epoch as "now" so the resume task fires immediately
+            #       (capped at -12h: anything further back is almost certainly
+            #       a stale screen for *yesterday's* limit — roll to tomorrow).
             d = now.date()
             candidate = dt.datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz)
-            if candidate <= now:
-                candidate += dt.timedelta(days=1)
-            return candidate.timestamp()
+            if candidate > now:
+                return candidate.timestamp()
+            if (now - candidate).total_seconds() <= 12 * 3600:
+                return now.timestamp()
+            return (candidate + dt.timedelta(days=1)).timestamp()
         except Exception:
             log.exception("_parse_reset_time: unexpected error on pattern %d", idx)
             continue
     return None
+
+
+def _find_queued_drafts(screen: str) -> list[str]:
+    """Return list of queued draft message texts visible below the input box.
+    Claude Code TUI renders queued drafts as lines starting with `｜<text>`
+    (U+FF5C fullwidth vertical bar). Trailing spaces are stripped; empty/
+    whitespace-only drafts are skipped."""
+    out: list[str] = []
+    for line in screen.splitlines():
+        s = line.lstrip()
+        if not s.startswith(QUEUE_MARKER):
+            continue
+        body = s[len(QUEUE_MARKER):].rstrip()
+        if body:
+            out.append(body)
+    return out
 
 
 def detect_rate_limit(screen: str, cfg: dict[str, Any]) -> float | None:
@@ -1568,11 +1606,11 @@ def detect_rate_limit(screen: str, cfg: dict[str, Any]) -> float | None:
         return None
     if not RATE_LIMIT_PHRASE_RE.search(screen):
         return None
-    # Enter only makes sense if a numbered menu cursor is visible — without
-    # the `❯ N.` highlight, Enter would submit an empty input box instead.
-    tail_lines = screen.splitlines()[-30:]
-    if not any(MENU_CHOICE_RE.match(l) for l in tail_lines):
-        return None
+    # Note: real Claude Code rate-limit screens render as a tool-result chunk
+    # (`⎿ You've hit your limit · resets …`) above an empty input box — there
+    # is NO numbered menu cursor (`❯ 1.`) to Enter-confirm. Detection only
+    # requires the phrase + a parseable reset time; the resume task types the
+    # configured text once the reset epoch passes.
     epoch = _parse_reset_time(screen, str(cfg.get("rate_limit_tz_fallback", "Asia/Taipei")))
     if epoch is None:
         return None
@@ -1615,18 +1653,17 @@ async def _resume_after_rate_limit(
         if not fresh:
             log.warning("rate-limit resume: capture failed pane=%d", pane.pane_id)
             return
-        if RATE_LIMIT_PHRASE_RE.search(fresh):
-            log.info("rate-limit resume: pane=%d still rate-limited; retrying in 30s",
-                     pane.pane_id)
-            new_epoch = time.time() + 30.0 - buffer_s
-            state.rate_limit_resume_at = new_epoch
-            state.rate_limit_task = asyncio.create_task(
-                _resume_after_rate_limit(pane, state, new_epoch, cfg, dry_run)
-            )
-            return
         cls = classify(fresh)
-        if cls == "working":
-            log.info("rate-limit resume: pane=%d is working; retrying in 30s", pane.pane_id)
+        # Once reset_epoch has passed we proceed regardless of whether the
+        # limit phrase is still on screen — Claude Code TUI does NOT auto-
+        # refresh after the limit lifts, so the stale "You've hit your limit"
+        # text persists in the scrollback until the user (or daemon) sends
+        # something. Only retry when Claude is genuinely still working
+        # (active spinner / tool-output expand hint) or when we somehow
+        # fired before the reset epoch.
+        if cls == "working" or time.time() < reset_epoch:
+            log.info("rate-limit resume: pane=%d not ready (class=%s, pre-reset=%s); retrying in 30s",
+                     pane.pane_id, cls, time.time() < reset_epoch)
             new_epoch = time.time() + 30.0 - buffer_s
             state.rate_limit_resume_at = new_epoch
             state.rate_limit_task = asyncio.create_task(
@@ -1638,9 +1675,23 @@ async def _resume_after_rate_limit(
                      pane.pane_id, cls)
             return
         resume_text = str(cfg.get("rate_limit_resume_text", "繼續"))
+        # Claude Code TUI's queued-draft auto-flush is unreliable when the
+        # underlying API connection has dropped (the rate-limit error path
+        # often leaves the TUI in a "disconnected" state where queued
+        # `｜<text>` drafts never auto-submit even after the limit lifts).
+        # Always type the resume text + Enter to guarantee a visible submit —
+        # accept the small risk of a duplicate if Claude eventually does
+        # auto-flush a matching queued draft. Users who don't want this
+        # behaviour can clear their queue or set rate_limit_resume_text="".
+        queued = _find_queued_drafts(fresh)
+        if queued:
+            log.info("rate-limit resume: pane=%d existing queued drafts %r — typing anyway",
+                     pane.pane_id, queued)
+        if not resume_text:
+            log.info("rate-limit resume: pane=%d resume_text empty; aborting", pane.pane_id)
+            return
         if dry_run:
-            log.info("rate-limit resume DRY-RUN pane=%d would send text=%r",
-                     pane.pane_id, resume_text)
+            log.info("rate-limit resume DRY-RUN pane=%d would type %r", pane.pane_id, resume_text)
             outcome = f"dry-run:text:{resume_text}"
         else:
             try:
@@ -1703,37 +1754,25 @@ async def handle_pane(
 
             # Rate-limit short-circuit: highest priority, runs before any
             # codex round-trip. Deterministic signal — when Claude Code shows
-            # "You've hit your limit · resets …" with a numbered menu, press
-            # Enter (accept the highlighted "Stop and wait" option) and
-            # schedule a delayed resume that types `rate_limit_resume_text`
-            # after the reset time passes. Does not append to
+            # "You've hit your limit · resets <time>", schedule a resume task
+            # that types `rate_limit_resume_text` after the reset epoch passes.
+            # No immediate keystroke is sent: the limit screen has no menu to
+            # confirm, just an idle input box. Does not append to
             # responses_in_window — being throttled is a system response, not
             # a codex action, and must not count toward the killswitch.
             rl_epoch = detect_rate_limit(snapshot, cfg)
             if rl_epoch is not None:
-                log.info("rate-limit detected pane=%d reset_epoch=%.0f",
-                         pane.pane_id, rl_epoch)
-                if dry_run:
-                    rl_outcome = "dry-run:enter"
-                else:
-                    try:
-                        rl_outcome = await apply_action(
-                            pane, "enter", None,
-                            baseline=snapshot,
-                            scrollback=int(cfg["capture_scrollback_lines"]),
-                        )
-                    except Exception as e:
-                        log.exception("rate-limit Enter apply_action failed pane=%d", pane.pane_id)
-                        rl_outcome = f"apply-error:{e}"
+                log.info("rate-limit detected pane=%d reset_epoch=%.0f wait=%.1fs",
+                         pane.pane_id, rl_epoch, max(0.0, rl_epoch - time.time()))
                 _schedule_rate_limit_resume(pane, state, rl_epoch, cfg, dry_run)
                 state.cooldown_until = time.time() + float(cfg["per_pane_cooldown_seconds"])
                 try:
                     audit(
                         pane, snapshot,
-                        {"action": "enter", "value": None,
+                        {"action": "skip", "value": "rate-limit-wait",
                          "source": "rate-limit-detect",
                          "resume_epoch": rl_epoch},
-                        f"rate-limited:{rl_outcome}", cfg,
+                        "rate-limited:scheduled", cfg,
                     )
                 except Exception:
                     log.exception("audit write failed (rate-limit detect)")
@@ -2219,11 +2258,26 @@ async def run_once(cfg: dict[str, Any], dry_run: bool = False) -> int:
         return 0
     print(f"triggering codex for {len(triggerable)} pane(s) "
           f"(dry_run={dry_run}) ...")
+    states: list[PaneState] = []
     for pane, cls, screen in triggerable:
         state = PaneState()
         state.last_classification = cls
         state.in_flight = True
         await handle_pane(pane, state, screen, cfg, dry_run)
+        states.append(state)
+    # `handle_pane` may have scheduled a background `rate_limit_task` that
+    # fires `rate_limit_resume_buffer_seconds` after the reset epoch. Without
+    # explicitly awaiting them, `asyncio.run()` tears down the loop and
+    # cancels every pending task before the resume actually executes —
+    # producing the "scheduled / cancelled in the same second" log entries
+    # users see when smoke-testing rate-limit handling with `--once`. Await
+    # any live resume tasks so the single-tick run actually exercises the
+    # resume path.
+    pending = [s.rate_limit_task for s in states
+               if s.rate_limit_task is not None and not s.rate_limit_task.done()]
+    if pending:
+        print(f"awaiting {len(pending)} rate-limit resume task(s) ...")
+        await asyncio.gather(*pending, return_exceptions=True)
     return 0
 
 
