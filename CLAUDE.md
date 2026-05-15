@@ -54,7 +54,10 @@ $env:WATCHER_SOCKET_PORT = "47900"; uv run watcher.py       # 改用其他 port
 
 `wezterm cli list --format json` 列出全部 pane（**不像 tmux 有 `pane_current_command` 可 pre-filter**——WezTerm JSON 只給 `pane_id` / `window_id` / `tab_id` / `workspace` / `title` / `cwd`，沒有可信賴的「是否在跑 claude」欄位）。對每個 pane 跑 `wezterm cli get-text` 抓畫面，靠 `classify()` 視覺指紋判定三類，只有 `input` 與 `menu` 會送 codex：
 
-- `working`：title 首字是 Braille spinner（U+2800–U+28FF），**或**畫面**最後 5 行**含 `esc to interrupt` / `(ctrl+o to expand)`。只看尾段是刻意的——`(ctrl+o to expand)` 在折疊的 tool-output（`+N lines (ctrl+o to expand)`）也會出現，掃到 scrollback 就會誤判 working。
+- `working`：兩條 OR：
+  - 畫面**最後 5 行**含 `esc to interrupt` / `(ctrl+o to expand)`——只看 5 行刻意的，`(ctrl+o to expand)` 在折疊的 tool-output（`+N lines (ctrl+o to expand)`）也會出現，掃到 scrollback 就會誤判。
+  - 畫面**最後 15 行**有任一行被 `_BAKED_RE` 匹配（spinner 計時行如 `✶ Wibbling… (1m 2s · ↓ 2.8k tokens · ...)` / `✻ Sautéed for 6m 53s`）。spinner 行位置在 input box HR sandwich 正上方、tail -8 ~ -10 之間，5 行窗口蓋不到必須擴大。`_BAKED_RE` 是 anchored 且具體（spinner glyph + 詞 + `(\d…)` 計時器或 `for \dm \ds`），擴到 15 行不會被 scrollback 雜訊誤觸。
+  - ~~title 首字 Braille spinner~~：原本規格寫了沒實作，現由 `_BAKED_RE` 抓 spinner 行覆蓋（更精確，title 在某些 Claude Code 版本不可靠）。
 - `menu`：尾段有 `❯ 1.` / `❯ 2.` 編號選單（`MENU_CHOICE_RE`）。
 - `input`：尾段呈現「水平線 + `❯ ` 空輸入 + 水平線」的輸入框。
   - 水平線判定用 `line.count("─") >= 50`（`is_hr_line`）而非整行全 `─` 的 regex——頂部水平線會嵌入 session 標籤 `─── claude-codex-auto-responder ──`。
@@ -77,6 +80,19 @@ WezTerm pane id 是**整數**（例如 `4`、`13`），不是 tmux 的 `%18`。`
 
 > 經 codex 真實呼叫的回應才會 append 到 `responses_in_window`。
 
+### Action Loop（multi-stage selector 推進機制）
+
+`handle_pane` 跑一個 **action-loop**：送 action → wait `action_loop_post_action_wait_seconds` → re-capture → 若仍 `input`/`menu` 再 call codex 推下一步，直到 pane 變 `working`（Claude 接收 keystroke 並開始處理）或達 `action_loop_max_iters`（預設 3）。
+
+- **為何要 loop**：Claude Code multi-stage selector 每階段選項不同，下階段內容須看下階段畫面才知，**一次 codex call 無法把所有 stage 算出來**。loop 讓 codex 每階段看真畫面決策。
+- **Killswitch 計入**：整個 loop **算一次** `responses_in_window` entry——multi-stage 一次推進 3 stage 不會把 budget 燒光。cooldown 也在 loop 結束才 set 一次。
+- **每 iter 寫獨立 audit**：`logs/triggers/<ts>-<pane>.json` 一個 iter 一個 timestamp，方便追蹤推進過程。每 iter 各自走 cache / predictor / codex / apply 短路。
+- **退出條件**：codex 回 `skip` / cache hit / predictor / `rate-limited` / `error` 立刻退；`aborted-pane-changed` / `apply-error` / `unknown-*` / `invalid-*` / `empty-*` / `too-many-*` 退；dry-run 模式只跑 1 iter；re-capture 後 class 變 `working` 或非 `input`/`menu` 退。
+- **關閉**：`action_loop_enabled = false`（或 max_iters=1）→ 退回一次性行為。
+- **Config**：`action_loop_max_iters`（default 3、上限你自訂）、`action_loop_post_action_wait_seconds`（default 4.0，給 Claude TUI 消化 keystroke 並渲染下階段 / 開始 working 的 buffer）。
+
+> Loop 內 `apply_action` 仍會做 baseline diff（送 action 前 re-capture 比對 `_clean_screen`），避免人為操作期間覆蓋。Loop 自己的 re-capture 則發生在 action **送完後**、不做 diff，純粹為下一輪 codex 決策提供新畫面。
+
 ### Codex 呼叫（`call_codex`，與 codex-cli 0.130.0 驗證過）
 
 ```
@@ -93,6 +109,15 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 - subprocess gotcha：stdout 設 `DEVNULL`、stderr 走 PIPE，避免 deadlock；POSIX 用 `start_new_session=True`、Windows 用 `creationflags=CREATE_NEW_PROCESS_GROUP`；timeout 後 `terminate` 再 5s `kill`。
 - 回傳 JSON 由 `response_schema.json`（strict structured output）強制。注意 strict 模式**所有欄位都必須在 `required`**，optional 欄位只能宣告成 `["string", "null"]` 並回 `null`，**不可直接省略 key**。
 
+### Prompt 模式（`prompt_mode`）
+
+`build_prompt` 依 `cfg["prompt_mode"]` 從兩個 template 擇一：
+
+- **`autonomous`（預設）**：`PROMPT_TEMPLATE_AUTONOMOUS`——四段架構（環境真相 / 自主操作協議 / 安全閘 / 退化決策表）。給 codex TUI mental model + footer 提示閱讀協議，由 codex 自己看畫面 footer（`Enter to select · Tab/Arrow keys to navigate`、`Press 1 to ...`、`y/n` 等）決定要送什麼 action。對 Claude Code 新增的 UI mode（multi-stage selector、plan mode、custom modal）覆蓋率較高，無須每加一種 UI 都改 prompt。
+- **`legacy`**：`PROMPT_TEMPLATE_LEGACY`——原本的硬寫決策表版本。當 autonomous 對某類畫面 regress 時可暫時 fallback：`WATCHER_PROMPT_MODE=legacy uv run watcher.py` 或 `config.toml` 設 `prompt_mode = "legacy"`。
+
+**為何不全改成 autonomous 砍 legacy**：autonomous 對既有穩定 case（一般編號選單、純 narrative 推進）可能 regress，保 legacy 作 escape hatch；確認 autonomous 在你環境穩定後再考慮刪。改 prompt 時兩個 template 都改、別只改一邊。
+
 ### Action 套用（`apply_action`）
 
 在 send-text 前**再抓一次畫面**和 baseline 比對，不同就回 `aborted-pane-changed`，防止 codex 思考期間人為操作被覆蓋。`action`：
@@ -100,6 +125,7 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 - `text` → 兩次 `wezterm cli send-text --no-paste --pane-id N` call：第一次送 `<value>`（無 CR）、`asyncio.sleep(0.15)`、第二次送 `\r`。**不要把 text + `\r` 合在同一 payload**——Claude Code 的輸入處理會把整批當 paste-like 處理，trailing `\r` 變成「輸入內換行」而非 submit。兩 call 都帶 `--no-paste`、中間 small delay 讓 TUI 把第二次當乾淨的 Enter keystroke。
 - `key`  → 單次 call，payload `<digit>\r`（`value` 必須是長度 1 的數字）。短 payload 不會觸發 paste-like 啟發。
 - `enter` → 單次 call，payload `\r`
+- `keys` → 多步按鍵序列。用於 Claude Code 自訂選單需游標移動才能確認的場景（例：「↓↓ Enter 抵達 Next」）。value 是 comma-separated tokens，合法 token：`enter` / `tab` / `up` / `down` / `left` / `right` / `esc`，對應 ANSI escape（`down` → `\x1b[B` 等）。逐 token `wezterm cli send-text --no-paste` 並 sleep 0.15s。**上限 10 tokens** 防 codex 推太長序列；空 value / 非法 token / 超長分別回 `empty-keys` / `unknown-key-token:<x>` / `too-many-keys:<n>`。baseline diff 只在序列**開頭**比一次，中途 UI 變動不 abort——兩個 PROMPT_TEMPLATE 均要求 codex 不確定就 `skip unclear-ui` / `menu-cursor-unknown`，不要盲試方向鍵。
 - `skip` → 不動、寫 audit
 
 **重要**：`--no-paste` 是強制的——預設 bracketed-paste 模式會被 Claude Code TUI 當作貼上資料而非按鍵，可能不會自動送出。長字串 + `\r` 的單次 call 即使加 `--no-paste` 仍會被 TUI 當 paste burst → 拆兩次 call 才能穩定 submit（已實測長中文 reply 失敗、拆 call 後正常）。
@@ -144,7 +170,7 @@ Phase 1 spike R3 驗證 **Claude Code 會把 `WEZTERM_PANE` 環境變數傳入 S
 - **不要在 `is_empty_prompt_line` / `is_hr_line` 改成嚴格 regex**——上面說明的 NBSP 與嵌入式 session label 都會破壞 strict match。
 - **不要把 `(ctrl+o to expand)` 的偵測範圍擴大到整個 scrollback**，會誤把 collapsed tool-output 判成 working。
 - 加新分類前先確認 `should_trigger` 的 `classification not in ("input", "menu")` 過濾；想讓新分類觸發 codex 必須一起改。
-- 改 `PROMPT_TEMPLATE` 時保持「PREFER MAKING A DECISION OVER SKIPPING」的調性；之前的保守版會在明明可答的畫面回太多 `skip`。
+- 改 `PROMPT_TEMPLATE_AUTONOMOUS` / `PROMPT_TEMPLATE_LEGACY` 時保持「PREFER MAKING A DECISION OVER SKIPPING」的調性；之前的保守版會在明明可答的畫面回太多 `skip`。兩個 template 並存（由 `prompt_mode` 切換），改規則時兩邊都要更新或明確只改其一並備註原因。
 - 加新 question marker：用 `config.toml` 的 `skip_predictor_extra_markers`（小寫 substring 比對），不要直接動 `DEFAULT_QUESTION_MARKERS`。
 - 新增 config key：必須同時加進 `DEFAULTS` dict（type 決定 env var coerce 行為），TOML 與 env var 才會被解析。
 - **不要把 `pane_id` 改回字串**——它是 int，貫穿 audit log、state file key、wezterm cli 參數。`milestone-toggle.json` 內 key 雖然是 str（JSON 強制），但讀寫時都用 `str(pane_id)` 包裝。
