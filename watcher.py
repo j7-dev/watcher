@@ -157,14 +157,39 @@ HR_DASH_THRESHOLD = 50  # min count of `─` chars on a line to call it a horizo
 # circuit and save the round-trip. Users can extend via
 # config.skip_predictor_extra_markers (case-insensitive substring match).
 DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
+    # 標點
     "?", "？",
-    "do you", "would you", "shall i", "should i",
+
+    # 英文詢問句型
+    "do you", "would you", "want me to", "would you like",
+    "shall i", "shall we", "should i", "may i",
+    "let me know", "tell me",
+    "which", "prefer",
+
+    # 英文確認/執行
     "continue", "confirm", "proceed", "approve",
-    "press", "choose", "select", "pick",
-    "y/n", "yes/no", "(y/n)", "yes",
-    "是否", "要不要", "請選", "請輸入", "請問", "確認",
-    "要嗎", "要嘛",
-		"下一步", "for future", "接下來"
+    "ready", "sound good", "ok?", "okay?",
+
+    # 英文選擇/輸入提示
+    "press", "choose", "select", "pick", "option",
+    "y/n", "yes/no", "(y/n)",
+    "reply with",
+
+    # 中文詢問
+    "是否", "要不要", "要嗎",
+    "請選", "請輸入", "請問", "請告知",
+    "還是", "哪個", "哪一個", "哪種",
+    "想要", "偏好", "比較喜歡",
+
+    # 中文確認
+    "確認", "同意", "好嗎", "可以嗎", "行嗎",
+    "怎麼樣", "如何",
+    "告訴我", "讓我知道",
+    "繼續嗎", "開始嗎",
+    "選哪", "選擇",
+
+    # 下一步
+    "下一步", "接下來", "後續", "for future", "remaining", "剩下", "剩餘"
 )
 NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
 
