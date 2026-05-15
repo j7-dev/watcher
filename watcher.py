@@ -36,7 +36,7 @@ SCHEMA_PATH = WATCHER_DIR / "response_schema.json"
 LOG_DIR = WATCHER_DIR / "logs"
 TRIGGER_DIR = LOG_DIR / "triggers"
 
-PROMPT_TEMPLATE = """\
+PROMPT_TEMPLATE_LEGACY = """\
 你是 Claude Code 終端 pane 的自動回應決策代理人。每次呼叫你會收到一張
 靜態畫面快照，pane 已閒置數秒。你的任務：以符合 schema 的 JSON 回一個
 action。
@@ -109,6 +109,11 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
 - `text`  value=<回覆文字>     → 輸入自由文字並 Enter
 - `key`   value="1" | "2" | … → 按單一數字選編號
 - `enter` value=null           → 僅按 Enter（接受游標所在預設）
+- `keys`  value="<tok>,<tok>"  → 多步按鍵序列（≤ 10 tokens），
+    合法 token：`enter` / `tab` / `up` / `down` / `left` / `right` / `esc`。
+    用於 Claude Code 自訂選單需要游標移動才能確認的場景
+    （例：「↓ ↓ Enter」抵達 Next 按鈕並確認 → value="down,down,enter"）。
+    僅在畫面**明確**呈現需多步移動的 UI 時使用；一般編號選單仍用 `key`。
 - `skip`  value=<原因短句>     → 不動作
 
 ═══ 決策表（5W1H 分析後對照） ═══
@@ -118,9 +123,36 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
     - 文字明顯是 user 草稿或答非所問 → `skip`，value=`user-mid-compose`
       或 `filled-input-mismatch`。
     - ⚠️ **不可用 `text`**——send-text 是 append 不是 replace，會串成亂碼。
-- `❯ 1.` 編號選單：
+- `❯ 1.` 編號選單（**單階段**：footer 無 `Tab/Arrow keys to navigate`）：
     - 游標 `❯` 已在你要選的項上 → `enter`（最不易誤觸）。
     - 要切非游標項 → `key` value="<該數字>"。
+- **Multi-Stage Selector**（Claude Code 多階段選單，**強制用 `keys`、不可用單 `enter`**）：
+    - 識別線索（**任一**命中即視為此模式）：
+      a) 畫面底部 footer 含 `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
+      b) 頂部含 stage 指示器列：`←  ☐ X  ☐ Y  ✔ Z  →`（含左右箭頭與
+         ☐/✔ 標記，每個 ☐ 或 ✔ 各代表一個 stage）
+    - **關鍵差異**：此 UI 的 Enter 只 toggle 當前 checkbox **不送出**——
+      須 Tab/→ 推進到最末 stage（通常 `Submit`）再 Enter 才真送。
+    - 流程：
+      1. **選項**：游標 `❯` 已在目標項 → 序列首位 `enter`（toggle）；
+         否則先用 `down`/`up` 對位、再 `enter`。
+      2. **推 stage**：數頂部 indicator 從當前 stage 到 `Submit` 還差幾個
+         （每個 ☐/✔ 算一格，當前 stage 通常是最左未完成的 ☐ 或第一個）→
+         用對應數量的 `tab`。
+      3. **送出**：末尾加 `enter` 觸發 Submit stage。
+    - 範例：游標 `❯ 1.` 已在目標項 1、stage indicator
+      `←  ☐ 改動範圍  ☐ 段落  ✔ Submit  →`，目前在「改動範圍」（最左 ☐），
+      到 Submit 還差 2 個 tab → `keys` value=`enter,tab,tab,enter`。
+    - 序列長度 ≤ 10；超過代表你在猜，改 `skip` value=`multi-stage-too-deep`。
+    - **不確定**目前 stage 位置 / Submit 在第幾格 / 該選哪項 →
+      `skip` value=`multi-stage-unclear`，不要盲試方向鍵。
+- 自訂選單（無 `❯ <數字>` 編號、改用方向鍵 highlight 行 + Next/Confirm 按鈕，
+  **非** multi-stage selector）：
+    - 計算游標目前位置到目標項需按幾下 ↓（或 ↑）→ `keys`
+      value="down,down,...,enter"（最後加 `enter` 觸發 Next）。
+    - 序列長度 ≤ 10；超過代表你在猜，改 `skip` value=`menu-too-deep`。
+    - 若不確定當前 highlight 在哪 → `skip` value=`menu-cursor-unknown`，
+      不要盲試方向鍵。
 - 純訊息 / Claude narrative / 陳述下一步 → 依「自動推進原則」判 `text`：
     - 含明確 A/B 選擇 → 自主選一個（"做 A" / "先 X"）。
     - 純報告 / 無分岔 → 中性推進語（"繼續" / "好" / "OK" / "continue"）。
@@ -145,6 +177,142 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
 脈絡僅供消歧義（例：判斷 user 是否在 mid-compose、編號選單該選哪項
 最符合使用者意圖）。脈絡可能 stale（已換主題、清過 history）；與畫面
 不一致時直接忽略脈絡，不可因脈絡偏離畫面內容。
+
+{session_context}--- 畫面擷取（介於圍欄之間） ---
+```
+{screen}
+```
+"""
+
+# Autonomous prompt — gives codex a TUI mental model + safety guards instead of
+# hardcoded decision tables. Codex reads the on-screen footer hints
+# (`Enter to select · Tab/Arrow keys to navigate`, etc.) to decide which keys
+# to send, rather than matching watcher-side rules. Trade-off: higher coverage
+# of new Claude Code UI modes, slightly higher LLM variance — mitigated by the
+# safety guards in section C and the fallback table in section D.
+PROMPT_TEMPLATE_AUTONOMOUS = """\
+你是 Claude Code 終端 pane 的**自主 TUI 操作代理**。每次呼叫你會收到一張
+靜態畫面快照（pane 已閒置數秒），以符合 schema 的 JSON 回**一個** action。
+
+═══ 三條根本約束 ═══
+1. **無前後記憶**：除下方畫面與 session 脈絡外，你不知道任何事；不可腦補。
+2. **螢幕為唯一真實**：畫面看不到的就是不知道；session 脈絡只能消歧義，
+   與畫面衝突時以畫面為準。
+3. **行動代價不對稱**：錯 skip 代價小（user 下輪自處理）；錯
+   text/key/keys 可能不可逆。模糊時偏 skip，**但畫面明顯有等待答案的
+   問題、或 Claude 陳述了下一步打算做什麼時，請優先主動回覆。**
+
+═══ A. 環境真相（watcher 預處理副作用，畫面看不出來） ═══
+畫面已被 watcher classifier 預處理，符號語意與 raw TTY 不同：
+
+- `> <文字>`     → 已 submit 的歷史 user 訊息（不可變、僅供脈絡）。
+  **絕對不可**因看到 `>` 開頭就判 user-mid-compose。
+- `❯ <文字>`     → 底部 input box cursor + **未送出的草稿**（罕見；
+  通常是上輪自動化已 type 但 Enter 未送的 stale state）。
+- `❯ <數字>.`    → 編號選單 cursor，顯示目前 default 選項。
+- `<數字>. <文字>` / `<數字>) <文字>`（line-leading **裸數字**，無 `❯`）
+  → conversation 內文的編號列表，**不是** 互動 menu。即使含 `?`，
+  那也是內文的 rhetorical question 而非等 user 作答。
+- `｜<文字>`    → input box **下方的 queued message**：user 已預打但
+  尚未被 Claude 消化的下輪輸入。**絕對不可** echo / 抄此文字當你的
+  `text` 回覆——Claude 會自己處理它。看到 queued msg 時：
+    - 上方有真正等待 codex 回答的問題 → 正常依問題決策
+    - 沒有等待回答的問題（單純 queued msg 佔位） → `skip`
+      value=`queued-msg-pending`，讓 Claude 自己處理 queue。
+- 空 input box（`❯ ` + 兩條水平線包夾）已被預處理移除；畫面看不到時
+  即代表 input box 是空的、等待新輸入。
+- 開頭 `[…上文略]` 表示畫面已從中段截斷，**不可**用「畫面看不到 X」
+  反推「X 不存在」，對被截斷的脈絡保守。
+- 畫面是 viewport（~40-50 行），非完整 scrollback。
+
+═══ B. 自主 TUI 操作協議（主要決策路徑） ═══
+你看的是 Claude Code（與其他 TUI）的終端介面。**操作真相來源優先序**：
+
+1. **畫面 footer / 提示行的鍵盤說明** ← **最高優先**
+   - `Enter to select` → Enter 選當前 highlight
+   - `Tab/Arrow keys to navigate` → Tab 或方向鍵切游標
+   - `Esc to cancel` → 此 modal 可 Esc 取消
+   - `1/2/3 to select` 或 `Press <digit>` → 用 `key` action
+   - `y/n` / `(y/N)` → text "y" 或 "n"
+   - **沒明示就推論 TUI 通用 convention**（編號選單按數字、modal Enter 確認）。
+
+2. **stage / progress indicator**（多階段表單）
+   - 形如 `←  ☐ A  ☐ B  ✔ C  →` 或 `Step 1/3` 表示多階段。
+   - 此類 UI 的 Enter 在**非末段**通常只 toggle、不送出，須 Tab/→ 推 stage、
+     **最末段**才 Enter 真送。
+   - 數 stage 個數（每個 ☐/✔/●/○ 算一格），算到 Submit 還差幾格 → 對應數量
+     `tab`（或 `right`）。
+
+3. **selector 類型判斷**（無 footer 時 fallback heuristic）
+   - 有 `❯ <數字>.` 編號 → 單階段編號選單，`key` 數字或 `enter` 接受游標項
+   - 有 highlight 行（反白 / `>` cursor）+ Next/Confirm 按鈕 → 方向鍵移到目標
+     + Enter
+   - 純文字 input box（空 `❯ ` 行） → `text`
+
+═══ Action 工具箱 ═══
+- `text`  value=<文字>          → 輸入並 Enter 送出
+- `key`   value="1".."9"        → 單一數字鍵
+- `enter` value=null             → 純按 Enter
+- `keys`  value="<tok>,<tok>"    → 多步序列（≤ 10 tokens），合法 token：
+                                   `enter` / `tab` / `up` / `down` / `left` /
+                                   `right` / `esc`
+- `skip`  value=<原因短句>       → 不動作
+
+序列範例：
+- 編號選單已對位、需推 multi-stage 到 Submit（差 2 stage） →
+  `keys` value=`enter,tab,tab,enter`
+- 方向鍵 menu 游標需 ↓ 3 次到目標再 Enter → `keys` value=`down,down,down,enter`
+- 純 y/n 問句 → `text` value=`y`
+- 編號選單要選非 default 的 3 → `key` value=`3`
+
+═══ C. 安全閘（hard guards，任一命中 → skip） ═══
+1. **不可逆關鍵字**：narrative 提到下列任一 → `skip` value=`dangerous-narrative`：
+   - 破壞性 shell：`刪除` / `drop` / `rm -rf` / `force` / `砍掉` / `清空` /
+     `DROP TABLE` / `reset --hard` / `強推` / `--force-push` / `truncate`
+   - 外部發布 / 對外 commit：`gh issue create` / `gh pr create` / `推送` /
+     `推 repo` / `推上去` / `push` / `publish` / `deploy` / `release` /
+     `merge` / `git push` / `npm publish`
+   - 用戶自設窄門標籤：narrative 含 `窄門 (a)` / `窄門 (b)` / `窄門 (c)` /
+     `不可逆操作` / `irreversible` — 這些是用戶在 prompt 裡明示「需確認」
+     的訊號，直接 skip 讓用戶自己決定。
+2. **機密問詢**：畫面要求密碼／API key／個資而你不可能知道 →
+   `skip` value=`needs-secret`。
+3. **❯ <已有文字> 場景禁 text**：input box 已有草稿時，`text` 是 append
+   不是 replace，會串成亂碼。改 `enter`（若草稿合理）或 `skip`（若是
+   user mid-compose / 答非所問）。
+4. **不確定就 skip**：footer 沒提示、UI 看不懂、stage 數算不準 →
+   `skip` value=`unclear-ui`，**不要盲試方向鍵**。
+5. **序列上限 10 tokens**：超過代表你在猜 → `skip` value=`sequence-too-long`。
+6. **計畫被截斷**：Plan Mode 可見 `╰` 收尾卻看不到對應 `╭` 起頭 →
+   選「No, keep planning」而非盲核准。
+7. **滿意度問卷 / TUI modal**：畫面含 `How is Claude doing this session?` /
+   `1: Bad   2: Fine   3: Good   0: Dismiss` 或類似 Claude Code 內建問卷／
+   modal 提示 → `skip` value=`survey-modal`。這類 modal 的鍵盤事件由 TUI
+   直接接、**不**走 input box；watcher 的 `key`/`enter` 會送錯位置成為輸入
+   框內的訊息字元。（此情況 classify 已 short-circuit 到 `other`，理論上
+   codex 看不到——此規則為 fallback 防 classify 漏接的變體 marker。）
+
+═══ D. 退化決策表（B 段無法判斷時的 fallback） ═══
+- 空 input box（畫面尾無 `❯ <文字>`）+ 上方有問句 → `text` 精簡回答。
+- 純訊息 / Claude narrative / 陳述下一步：
+    - 含 A/B 明確選擇 → `text` 自主選一個（"做 A" / "先 X"）。
+    - 純報告 / 無分岔 → `text` value=`繼續` / `OK` / `continue`。
+- 真正純閒置（畫面空、無 Claude 輸出）→ `skip` value=`idle`。
+
+═══ 推進語規則 ═══
+- **避免猜畫面外細節**：不指定畫面看不到的 file 名 / 數字 / 路徑 / 變數；
+  但畫面已列出的選項（A/B、編號項）可直接引用做決策。
+- **長度**：純推進（"繼續" / "好" / "OK"）≤ 6 字；具體選擇 ≤ 30 字。
+- **語言匹配**：畫面中文 → 中文；畫面英文 → 英文（"continue" / "do A"）。
+
+═══ 選擇偏好（多個合理答案時的偏序） ═══
+- **提權 vs fallback**：選「純軟體 fallback」而非 sudo / 全域提權，
+  除非畫面明示必要。
+- **一次性 vs 永久**：同一肯定動作有「Yes」與「Yes, don't ask again」兩版
+  → 選永久核准，信任自動化、避免重複被問。
+
+═══ Session 脈絡使用規則 ═══
+脈絡僅供消歧義，可能 stale。與畫面不一致時直接忽略脈絡。
 
 {session_context}--- 畫面擷取（介於圍欄之間） ---
 ```
@@ -391,6 +559,11 @@ DEFAULTS: dict[str, Any] = {
     "capture_escalation_step": 400,
     "max_capture_scrollback_lines": 2000,
     "prompt_context_lines": 60,
+    # Prompt template mode: "autonomous" (default) gives codex a TUI mental
+    # model + safety guards and lets it pick keys from on-screen footer hints;
+    # "legacy" uses the original hardcoded decision table. Switch via
+    # `prompt_mode = "legacy"` in config.toml or WATCHER_PROMPT_MODE=legacy.
+    "prompt_mode": "autonomous",
     "hr_min_length": 50,
     "socket_enabled": True,
     "socket_host": "127.0.0.1",
@@ -407,6 +580,14 @@ DEFAULTS: dict[str, Any] = {
     "skip_predictor_lookback_lines": 15,
     "skip_predictor_extra_markers": [],
     "skip_decision_cache_ttl_seconds": 300,
+    # Action loop: after sending an action, re-capture the pane and call codex
+    # again if it's still input/menu (multi-stage selectors need this).
+    # Whole loop counts as ONE killswitch response, capped at max_iters to
+    # prevent runaway. Stops when pane goes `working` (Claude accepted) or
+    # codex returns skip/error.
+    "action_loop_enabled": True,
+    "action_loop_max_iters": 3,
+    "action_loop_post_action_wait_seconds": 4.0,
     "milestone_toggle_state_path": "",
     "milestone_command_text": "/milestone-runner",
     "milestone_max_reinjects_per_window": 5,
@@ -1075,12 +1256,42 @@ def capture_pane_adaptive(pane_id: int, cfg: dict[str, Any]) -> str:
 
 # ---------- classification -----------------------------------------------------
 
+_SURVEY_HINT = "How is Claude doing this session"
+
+
+def _is_survey_prompt(screen: str) -> bool:
+    """Claude Code shows an optional satisfaction modal whose keystrokes go to
+    the TUI directly (not the input box). Detect by the prompt's leading line.
+    Scan the last 25 lines — the modal sits above the input-box sandwich."""
+    for l in screen.rstrip("\n").splitlines()[-25:]:
+        if _SURVEY_HINT in l:
+            return True
+    return False
+
+
+_ONGOING_SPINNER_RE = re.compile(r"^\s*\S\s+\S.*?[…\.]+\s*\(\d")
+
+
 def is_working(screen: str) -> bool:
-    # Only check the bottom status bar — `(ctrl+o to expand)` legitimately
-    # appears deeper in scrollback inside collapsed tool-output blocks
-    # (`+N lines (ctrl+o to expand)`), which would falsely look like working.
-    tail = "\n".join(screen.rstrip("\n").splitlines()[-5:])
-    return any(h in tail for h in WORKING_HINTS)
+    lines = screen.rstrip("\n").splitlines()
+    # Tight 5-line tail check for hint substrings — `(ctrl+o to expand)`
+    # legitimately appears deeper in scrollback inside collapsed tool-output
+    # blocks (`+N lines (ctrl+o to expand)`), which would falsely look like
+    # working if we scanned further.
+    tight_tail = "\n".join(lines[-5:])
+    if any(h in tight_tail for h in WORKING_HINTS):
+        return True
+    # Ongoing spinner line ("✶ Wibbling… (1m 2s · ↓ 2.8k tokens · ...)" /
+    # "✻ Nebulizing… (24m 54s · ...)") sits just above the input-box HR
+    # sandwich — tail lines -8 to -10. _BAKED_RE also matches past-tense
+    # `for Nm Ns` (e.g. `✻ Worked for 1m 22s · 1 shell still running`,
+    # `✻ Baked for 2m 11s`) which signal COMPLETION not in-progress and would
+    # falsely classify a paused/done pane as working. Use a tighter regex that
+    # only matches the progressive `…(timer` form.
+    for l in lines[-15:]:
+        if _ONGOING_SPINNER_RE.match(l):
+            return True
+    return False
 
 
 def _has_input_box(screen: str) -> bool:
@@ -1113,6 +1324,15 @@ def _has_input_box(screen: str) -> bool:
 def classify(screen: str) -> str:
     if is_working(screen):
         return "working"
+    if _is_survey_prompt(screen):
+        # Claude Code's optional satisfaction modal
+        # (`How is Claude doing this session? · 1: Bad 2: Fine 3: Good 0: Dismiss`)
+        # captures keystrokes directly at the TUI level — it's NOT routed
+        # through the input box `❯ `. Sending `key=0` via `wezterm cli send-text`
+        # would deliver the digit into the input box (typed as a stale `0` text
+        # message to Claude), not dismiss the modal. Refuse to trigger codex on
+        # this screen; let the user dismiss it manually.
+        return "other"
     tail_lines = screen.splitlines()[-30:]
     if any(MENU_CHOICE_RE.match(l) for l in tail_lines):
         return "menu"
@@ -1299,7 +1519,9 @@ def build_prompt(
         trimmed = "[…上文略]\n" + trimmed
     rewritten = _rewrite_conversation_user_prefix(trimmed)
     stripped = _strip_input_box_tail(rewritten)
-    return PROMPT_TEMPLATE.format(
+    mode = str(cfg.get("prompt_mode", "autonomous")).strip().lower()
+    template = PROMPT_TEMPLATE_LEGACY if mode == "legacy" else PROMPT_TEMPLATE_AUTONOMOUS
+    return template.format(
         screen=stripped,
         session_context=_format_session_context(session_meta),
     )
@@ -1440,6 +1662,34 @@ async def apply_action(
         await asyncio.sleep(0.15)
         wezterm_send_text(pane.pane_id, "\r")
         return f"text:{len(sanitized)}chars"
+    if action == "keys":
+        # Multi-step key sequence — used for Claude Code menus that need cursor
+        # movement before confirmation (e.g. `↓ ↓ Enter` to reach a "Next"
+        # button). Each token is sent as its own send-text call so the TUI
+        # treats them as discrete keystrokes, not a paste burst.
+        if not value:
+            return "empty-keys"
+        TOKEN_MAP = {
+            "enter": "\r",
+            "tab": "\t",
+            "up": "\x1b[A",
+            "down": "\x1b[B",
+            "right": "\x1b[C",
+            "left": "\x1b[D",
+            "esc": "\x1b",
+        }
+        tokens = [t.strip().lower() for t in value.split(",") if t.strip()]
+        if not tokens:
+            return "empty-keys"
+        if len(tokens) > 10:
+            return f"too-many-keys:{len(tokens)}"
+        for tok in tokens:
+            payload = TOKEN_MAP.get(tok)
+            if payload is None:
+                return f"unknown-key-token:{tok!r}"
+            wezterm_send_text(pane.pane_id, payload)
+            await asyncio.sleep(0.15)
+        return f"keys:{','.join(tokens)}"
     return f"unknown-action:{action!r}"
 
 
@@ -1778,6 +2028,112 @@ def _schedule_rate_limit_resume(
 
 # ---------- per-pane handler ---------------------------------------------------
 
+async def _handle_pane_iteration(
+    pane: Pane,
+    state: PaneState,
+    snapshot: str,
+    cfg: dict[str, Any],
+    dry_run: bool,
+) -> tuple[str, str]:
+    """One iteration of action handling on a captured snapshot. Returns
+    (outcome, action) where outcome is the audit-log outcome string and action
+    is the codex-chosen action ("text"/"key"/"enter"/"keys"/"skip"/"error"/
+    "cached-skip"/"predicted-skip"/"rate-limited"). The outer loop uses the
+    action to decide whether to continue iterating."""
+    # Rate-limit short-circuit: highest priority, runs before any
+    # codex round-trip. Deterministic signal — when Claude Code shows
+    # "You've hit your limit · resets <time>", schedule a resume task
+    # that types `rate_limit_resume_text` after the reset epoch passes.
+    rl_epoch = detect_rate_limit(snapshot, cfg)
+    if rl_epoch is not None:
+        log.info("rate-limit detected pane=%d reset_epoch=%.0f wait=%.1fs",
+                 pane.pane_id, rl_epoch, max(0.0, rl_epoch - time.time()))
+        _schedule_rate_limit_resume(pane, state, rl_epoch, cfg, dry_run)
+        try:
+            audit(
+                pane, snapshot,
+                {"action": "skip", "value": "rate-limit-wait",
+                 "source": "rate-limit-detect",
+                 "resume_epoch": rl_epoch},
+                "rate-limited:scheduled", cfg,
+            )
+        except Exception:
+            log.exception("audit write failed (rate-limit detect)")
+        return "rate-limited:scheduled", "rate-limited"
+
+    session_meta = extract_session_meta(state.transcript_path)
+    clean = _clean_screen(snapshot)
+    cache_context = (session_meta or {}).get("current_request", "")
+    shash = _screen_hash(clean, cache_context)
+    cache_ttl = float(cfg["skip_decision_cache_ttl_seconds"])
+    pre_now = time.time()
+
+    cached = _cache_lookup(shash, pre_now)
+    if cached is not None:
+        log.info("cache hit for %s: %s", pane.pane_id, cached.get("action"))
+        cached_decision = {**cached, "source": "cache"}
+        try:
+            audit(pane, snapshot, cached_decision, "cached-skip", cfg)
+        except Exception:
+            log.exception("audit write failed")
+        return "cached-skip", "cached-skip"
+
+    if bool(cfg["skip_predictor_enabled"]):
+        reason = predict_skip(
+            clean,
+            state.last_classification,
+            int(cfg["skip_predictor_lookback_lines"]),
+            _build_markers(cfg),
+        )
+        if reason:
+            log.info("predicted skip for %s: %s", pane.pane_id, reason)
+            decision = {"action": "skip", "value": reason, "source": "predicted"}
+            _cache_store(shash, decision, cache_ttl, pre_now)
+            try:
+                audit(pane, snapshot, decision, "predicted-skip", cfg)
+            except Exception:
+                log.exception("audit write failed")
+            return "predicted-skip", "predicted-skip"
+
+    codex_prompt = build_prompt(snapshot, cfg, session_meta=session_meta)
+    try:
+        decision = await call_codex(pane, codex_prompt, cfg)
+    except Exception as e:
+        log.error("codex call failed for %s: %s", pane.pane_id, e)
+        try:
+            audit(
+                pane, snapshot,
+                {"action": "error", "error": str(e)[:500]},
+                "codex-error", cfg, codex_prompt=codex_prompt,
+            )
+        except Exception:
+            log.exception("audit write failed")
+        return f"codex-error:{e}", "error"
+
+    action = decision.get("action", "")
+    value = decision.get("value")
+    log.info("codex decision for %s: action=%s value=%r", pane.pane_id, action, value)
+    if action == "skip":
+        _cache_store(shash, dict(decision), cache_ttl, time.time())
+    if dry_run:
+        outcome = f"dry-run:{action}:{(value or '')[:80]}"
+    else:
+        try:
+            outcome = await apply_action(
+                pane, action, value, baseline=snapshot,
+                scrollback=int(cfg["capture_scrollback_lines"]),
+            )
+        except Exception as e:
+            log.exception("apply_action failed for %s", pane.pane_id)
+            outcome = f"apply-error:{e}"
+    log.info("outcome %s: %s", pane.pane_id, outcome)
+    try:
+        audit(pane, snapshot, decision, outcome, cfg, codex_prompt=codex_prompt)
+    except Exception:
+        log.exception("audit write failed")
+    return outcome, action
+
+
 async def handle_pane(
     pane: Pane,
     state: PaneState,
@@ -1785,120 +2141,76 @@ async def handle_pane(
     cfg: dict[str, Any],
     dry_run: bool,
 ) -> None:
+    """Trigger handler. Runs an action-loop: send action → wait → re-capture →
+    if pane is still input/menu, call codex again to push the next step in a
+    multi-stage UI; stop when the pane goes `working` (Claude accepted and is
+    processing) or after `action_loop_max_iters` iterations. The whole loop
+    counts as one entry in `responses_in_window` (killswitch budget), not one
+    per iteration — multi-stage selectors would otherwise burn the budget."""
     try:
         async with state.lock:
-            log.info("trigger %s class=%s title=%r", pane.pane_id, state.last_classification, pane.title)
+            log.info("trigger %s class=%s title=%r",
+                     pane.pane_id, state.last_classification, pane.title)
 
-            # Rate-limit short-circuit: highest priority, runs before any
-            # codex round-trip. Deterministic signal — when Claude Code shows
-            # "You've hit your limit · resets <time>", schedule a resume task
-            # that types `rate_limit_resume_text` after the reset epoch passes.
-            # No immediate keystroke is sent: the limit screen has no menu to
-            # confirm, just an idle input box. Does not append to
-            # responses_in_window — being throttled is a system response, not
-            # a codex action, and must not count toward the killswitch.
-            rl_epoch = detect_rate_limit(snapshot, cfg)
-            if rl_epoch is not None:
-                log.info("rate-limit detected pane=%d reset_epoch=%.0f wait=%.1fs",
-                         pane.pane_id, rl_epoch, max(0.0, rl_epoch - time.time()))
-                _schedule_rate_limit_resume(pane, state, rl_epoch, cfg, dry_run)
-                state.cooldown_until = time.time() + float(cfg["per_pane_cooldown_seconds"])
-                try:
-                    audit(
-                        pane, snapshot,
-                        {"action": "skip", "value": "rate-limit-wait",
-                         "source": "rate-limit-detect",
-                         "resume_epoch": rl_epoch},
-                        "rate-limited:scheduled", cfg,
-                    )
-                except Exception:
-                    log.exception("audit write failed (rate-limit detect)")
-                return
-
-            # Best-effort: enrich the codex prompt with Claude Code session
-            # metadata (title + initial/current user request) when we have a
-            # transcript_path from a recent Stop-hook payload. None on
-            # polling-only panes — codex falls back to screen-only reasoning.
-            session_meta = extract_session_meta(state.transcript_path)
-
-            # Pre-codex short-circuits: cache hit, then heuristic skip predictor.
-            # Mix current_request into the cache key so the same visual prompt
-            # under different user intents does not share a skip decision.
-            clean = _clean_screen(snapshot)
-            cache_context = (session_meta or {}).get("current_request", "")
-            shash = _screen_hash(clean, cache_context)
-            cache_ttl = float(cfg["skip_decision_cache_ttl_seconds"])
             cooldown = float(cfg["per_pane_cooldown_seconds"])
-            pre_now = time.time()
-            cached = _cache_lookup(shash, pre_now)
-            if cached is not None:
-                log.info("cache hit for %s: %s", pane.pane_id, cached.get("action"))
-                state.cooldown_until = pre_now + cooldown
-                cached_decision = {**cached, "source": "cache"}
-                try:
-                    audit(pane, snapshot, cached_decision, "cached-skip", cfg)
-                except Exception:
-                    log.exception("audit write failed")
-                return
-            if bool(cfg["skip_predictor_enabled"]):
-                reason = predict_skip(
-                    clean,
-                    state.last_classification,
-                    int(cfg["skip_predictor_lookback_lines"]),
-                    _build_markers(cfg),
-                )
-                if reason:
-                    log.info("predicted skip for %s: %s", pane.pane_id, reason)
-                    state.cooldown_until = pre_now + cooldown
-                    decision = {"action": "skip", "value": reason, "source": "predicted"}
-                    _cache_store(shash, decision, cache_ttl, pre_now)
-                    try:
-                        audit(pane, snapshot, decision, "predicted-skip", cfg)
-                    except Exception:
-                        log.exception("audit write failed")
-                    return
+            loop_enabled = bool(cfg.get("action_loop_enabled", True))
+            max_iters = max(1, int(cfg.get("action_loop_max_iters", 3)))
+            post_wait = float(cfg.get("action_loop_post_action_wait_seconds", 4.0))
+            if not loop_enabled:
+                max_iters = 1
 
-            codex_prompt = build_prompt(snapshot, cfg, session_meta=session_meta)
-            try:
-                decision = await call_codex(pane, codex_prompt, cfg)
-            except Exception as e:
-                log.error("codex call failed for %s: %s", pane.pane_id, e)
-                now = time.time()
-                state.responses_in_window.append(now)
-                state.cooldown_until = now + cooldown
-                try:
-                    audit(
-                        pane, snapshot,
-                        {"action": "error", "error": str(e)[:500]},
-                        "codex-error", cfg, codex_prompt=codex_prompt,
-                    )
-                except Exception:
-                    log.exception("audit write failed")
-                return
-            action = decision.get("action", "")
-            value = decision.get("value")
-            log.info("codex decision for %s: action=%s value=%r", pane.pane_id, action, value)
-            if action == "skip":
-                _cache_store(shash, dict(decision), cache_ttl, time.time())
-            if dry_run:
-                outcome = f"dry-run:{action}:{(value or '')[:80]}"
-            else:
-                try:
-                    outcome = await apply_action(
-                        pane, action, value, baseline=snapshot,
-                        scrollback=int(cfg["capture_scrollback_lines"]),
-                    )
-                except Exception as e:
-                    log.exception("apply_action failed for %s", pane.pane_id)
-                    outcome = f"apply-error:{e}"
-            log.info("outcome %s: %s", pane.pane_id, outcome)
+            current_snapshot = snapshot
+            terminal_actions = {
+                "skip", "cached-skip", "predicted-skip",
+                "rate-limited", "error",
+            }
+            for iter_idx in range(max_iters):
+                outcome, action = await _handle_pane_iteration(
+                    pane, state, current_snapshot, cfg, dry_run,
+                )
+                # Stop loop on terminal action (skip / cache / predict / error /
+                # rate-limit) or on dry-run (no real keystroke fired).
+                if action in terminal_actions or dry_run:
+                    log.info("action-loop pane=%d stop iter=%d action=%s",
+                             pane.pane_id, iter_idx, action)
+                    break
+                # Stop on apply errors (aborted-pane-changed, apply-error,
+                # unknown-action, etc.) — outcome doesn't start with the action
+                # prefix when something went wrong.
+                if outcome.startswith(("aborted-", "apply-error", "unknown-", "invalid-",
+                                       "empty-", "too-many-")):
+                    log.info("action-loop pane=%d stop iter=%d apply-issue outcome=%s",
+                             pane.pane_id, iter_idx, outcome)
+                    break
+                if iter_idx + 1 >= max_iters:
+                    log.info("action-loop pane=%d max-iters reached (%d)",
+                             pane.pane_id, max_iters)
+                    break
+                # Wait for Claude TUI to ingest the keystroke and either start
+                # working or render the next stage of the menu.
+                await asyncio.sleep(post_wait)
+                fresh = capture_pane_adaptive(pane.pane_id, cfg)
+                if not fresh:
+                    log.info("action-loop pane=%d re-capture empty, stop",
+                             pane.pane_id)
+                    break
+                next_class = classify(fresh)
+                log.info("action-loop pane=%d iter=%d re-class=%s",
+                         pane.pane_id, iter_idx, next_class)
+                if next_class == "working":
+                    log.info("action-loop pane=%d reached working, stop",
+                             pane.pane_id)
+                    break
+                if next_class not in ("input", "menu"):
+                    log.info("action-loop pane=%d unexpected class=%s, stop",
+                             pane.pane_id, next_class)
+                    break
+                current_snapshot = fresh
+
+            # Whole loop = one killswitch entry, cooldown set once at the end.
             now = time.time()
             state.responses_in_window.append(now)
-            state.cooldown_until = now + float(cfg["per_pane_cooldown_seconds"])
-            try:
-                audit(pane, snapshot, decision, outcome, cfg, codex_prompt=codex_prompt)
-            except Exception:
-                log.exception("audit write failed")
+            state.cooldown_until = now + cooldown
     finally:
         state.in_flight = False
 
