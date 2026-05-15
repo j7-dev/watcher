@@ -120,10 +120,22 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 
 ### 安全閘開關（`safety_gate_enabled`）
 
-`build_prompt` 依 `cfg["safety_gate_enabled"]` 決定是否在 prompt 開頭注入 `SAFETY_GATE_OFF_OVERRIDE` 區塊：
+`build_prompt` 依 `cfg["safety_gate_enabled"]` 決定是否在 prompt 開頭注入 `SAFETY_GATE_OFF_OVERRIDE` 區塊。**窄門範圍刻意極窄**——只擋資料庫破壞性 SQL 與用戶顯式窄門標籤，日常 dev 流程一律放行。
 
-- **`true`（預設）**：不注入 override；codex 照 template 內既有的安全閘規則做事——narrative 含「不可逆關鍵字」(rm / drop / force / push / merge / publish / 刪除 / 砍掉 / DROP TABLE / reset --hard / 推送 ...) 或用戶窄門標籤（`窄門 (a)/(b)/(c)` / `不可逆操作` / `irreversible`）一律 `skip` value=`dangerous-narrative`；計畫被截斷的 Plan Mode 偏 `No, keep planning`。
-- **`false`（全自動）**：在 prompt 首段注入 override，明確告訴 codex 上述規則作廢、依畫面正常給 action。設定方式：`config.toml` 寫 `safety_gate_enabled = false` 或 `WATCHER_SAFETY_GATE_ENABLED=false uv run watcher.py`。
+**算窄門**（預設 `true` 時 codex 會 skip）：
+- 資料庫破壞性 SQL：`DROP TABLE` / `DROP DATABASE` / `DROP SCHEMA` / `TRUNCATE TABLE` / `DELETE FROM` 無 WHERE 條件 / 「刪資料庫」/「清空資料庫」/「砍掉整張表」
+- 用戶窄門標籤：narrative 含 `窄門 (a)/(b)/(c)` / `不可逆操作` / `irreversible`
+- 計畫被截斷的 Plan Mode：偏 `No, keep planning`（這條是保守反射，非關鍵字驅動）
+
+**不算窄門**（即使提到也照常給 action）：
+- git 操作：`commit` / `push` / `force-push` / `--force` / `reset --hard` / `rebase` / `merge` / 砍分支 / `revert`
+- 發布：`publish` / `deploy` / `release` / `gh pr create` / `gh issue create` / `npm publish` / `推送` / `推 repo`
+- 檔案：`rm` / `rm -rf` / `刪除` / `清空`（檔案 / 目錄層級，非 DB）
+- schema 異動非破壞性：`ALTER TABLE` / `CREATE TABLE` / migration
+
+**為何窄門收這麼緊**：使用者明確指示 push / publish / merge 等都是日常 dev 流程、有可逆手段（reflog / revert / 重發版），不應該因關鍵字觸發就 skip 卡住自動化。只有 DB 破壞性 SQL 真的不可逆（沒備份就回不來），值得當窄門。觸發 false positive 的成本（每次都要人手動 commit / push）遠大於漏接 false negative 的成本（萬一真的不該 push 至少還有 reflog）。
+
+**`false`（全自動）**：在 prompt 首段注入 override，明確告訴 codex 連 DB 破壞性 SQL 也照常給 action。設定方式：`config.toml` 寫 `safety_gate_enabled = false` 或 `WATCHER_SAFETY_GATE_ENABLED=false uv run watcher.py`。
 
 **永遠不受 flag 影響**（這些是正確性 guard 而非用戶窄門政策，override 區塊也明示保留）：
 - 機密問詢 skip（密碼／API key／個資）

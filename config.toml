@@ -22,12 +22,18 @@ socket_token               = ""          # 非空時 hook payload 必須帶相�
 codex_binary               = "codex"
 codex_timeout_seconds      = 90     # codex exec 單次最長等待
 
-# ---- 安全閘（窄門 / 不可逆動作 skip） ------------------------------------
-# 預設 true：codex 看到 narrative 含「不可逆關鍵字」(rm / drop / force / push /
-# merge / publish / release / 刪除 / 砍掉 / DROP TABLE / reset --hard / 推送 ...)
-# 或用戶窄門標籤（`窄門 (a)/(b)/(c)` / `不可逆操作` / `irreversible`）時，回 skip
-# value=`dangerous-narrative` 讓使用者自己決定。
-# 設 false 進入全自動：上述情境也照常給 action（text / key / keys / enter）。
+# ---- 安全閘（資料庫破壞性 SQL skip） -------------------------------------
+# 預設 true：codex 看到 narrative 含**資料庫破壞性 SQL** (DROP TABLE /
+# DROP DATABASE / DROP SCHEMA / TRUNCATE TABLE / DELETE FROM 無 WHERE /
+# 刪資料庫 / 清空資料庫 / 砍掉整張表) 或用戶窄門標籤（`窄門 (a)/(b)/(c)` /
+# `不可逆操作` / `irreversible`）時，回 skip value=`dangerous-narrative`。
+#
+# 日常 dev 流程**不**算窄門（codex 會照常給 action）：
+#   git push / force-push / reset --hard / rebase / merge / 砍分支 / revert /
+#   publish / deploy / release / gh pr create / npm publish / 推送 / 推 repo /
+#   rm / rm -rf / 刪除（檔案目錄） / commit / ALTER TABLE / CREATE TABLE / migration
+#
+# 設 false 進入全自動：連 DB 破壞性 SQL 也照常給 action。
 # **不受此 flag 影響的正確性 guard**（永遠開）：
 #   - 機密問詢 skip（畫面要求密碼／API key／個資）
 #   - `❯ <已有文字>` 場景禁 text（append 不是 replace，會串成亂碼）

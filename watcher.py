@@ -64,8 +64,11 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
   → `text`，value=具體推進指令（如 "繼續"、"開始 Week 2"、"執行下一步"）。
 - 陳述句 + 只是工作報告 / 無明確下一步（純成果總結、文件清單、task tick list）
   → `text`，value="繼續"，推 Claude 自行決定下一步。
-- **安全閘**：陳述句裡若提到不可逆關鍵字（刪除 / drop / rm / force / 砍掉 /
-  清空 / DROP TABLE / reset --hard / 強推），改 `skip` value=`dangerous-narrative`。
+- **安全閘**：陳述句裡若提到**資料庫破壞性 SQL**（`DROP TABLE` / `DROP DATABASE` /
+  `DROP SCHEMA` / `TRUNCATE TABLE` / `DELETE FROM` 無 WHERE 條件 / 刪資料庫 /
+  刪 table / 清空資料庫），改 `skip` value=`dangerous-narrative`。
+  ⚠️ git push / publish / deploy / release / merge / rm / 刪檔案 / commit 等
+  **不算窄門**——這些是日常 dev 流程，正常給 action。
 - 真正純閒置（畫面空、無內容、無 Claude 輸出）→ `skip` value=`idle`。
 
 推進語規則：
@@ -157,12 +160,15 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
     - 含明確 A/B 選擇 → 自主選一個（"做 A" / "先 X"）。
     - 純報告 / 無分岔 → 中性推進語（"繼續" / "好" / "OK" / "continue"）。
 - 純閒置（畫面真的沒內容） → `skip` value=`idle`。
-- 含不可逆關鍵字的 narrative → `skip` value=`dangerous-narrative`。
+- 含資料庫破壞性 SQL 的 narrative → `skip` value=`dangerous-narrative`。
 
 ═══ 安全閘（任一命中 → skip） ═══
 1. 提示要求畫面拿不到的機密（密碼／API key／個資）。
-2. 做錯會不可逆遺失工作（rm -rf、force-push、DROP TABLE、
-   dirty tree 上 git reset --hard、刪除有未合併 commit 的分支）。
+2. **資料庫破壞性 SQL**：narrative / 畫面提到 `DROP TABLE` / `DROP DATABASE` /
+   `DROP SCHEMA` / `TRUNCATE TABLE` / `DELETE FROM` 無 WHERE / 刪資料庫 /
+   刪 table / 清空資料庫 → `skip` value=`dangerous-narrative`。
+   ⚠️ git push / publish / deploy / release / merge / rm / 刪檔案 / commit /
+   force-push / reset --hard / 砍分支 等**不算窄門**——正常 dev 流程，照常給 action。
 3. 畫面沒有實際問題或選單，只是閒置。
 
 ═══ 選擇偏好（多個合理答案時的偏序） ═══
@@ -266,15 +272,23 @@ PROMPT_TEMPLATE_AUTONOMOUS = """\
 - 編號選單要選非 default 的 3 → `key` value=`3`
 
 ═══ C. 安全閘（hard guards，任一命中 → skip） ═══
-1. **不可逆關鍵字**：narrative 提到下列任一 → `skip` value=`dangerous-narrative`：
-   - 破壞性 shell：`刪除` / `drop` / `rm -rf` / `force` / `砍掉` / `清空` /
-     `DROP TABLE` / `reset --hard` / `強推` / `--force-push` / `truncate`
-   - 外部發布 / 對外 commit：`gh issue create` / `gh pr create` / `推送` /
-     `推 repo` / `推上去` / `push` / `publish` / `deploy` / `release` /
-     `merge` / `git push` / `npm publish`
-   - 用戶自設窄門標籤：narrative 含 `窄門 (a)` / `窄門 (b)` / `窄門 (c)` /
-     `不可逆操作` / `irreversible` — 這些是用戶在 prompt 裡明示「需確認」
-     的訊號，直接 skip 讓用戶自己決定。
+1. **資料庫破壞性 SQL**：narrative / 畫面明確提到下列任一 → `skip`
+   value=`dangerous-narrative`：
+   - `DROP TABLE` / `DROP DATABASE` / `DROP SCHEMA`
+   - `TRUNCATE TABLE` / `TRUNCATE` 整張表
+   - `DELETE FROM <table>` **無 WHERE 條件**（會清空整張表）
+   - 中文等價敘述：「刪資料庫」/「刪 table」/「清空資料庫」/「砍掉整張表」
+   - 用戶自設窄門標籤：`窄門 (a)` / `窄門 (b)` / `窄門 (c)` / `不可逆操作` /
+     `irreversible` — 這些是用戶在 prompt 裡明示「需確認」的訊號。
+
+   ⚠️ 以下**不算窄門**，narrative 提到也照常給 action（這些是日常 dev 流程、
+   或有可逆 / 可回退手段）：
+   - git: `commit` / `push` / `force-push` / `--force` / `reset --hard` /
+     `rebase` / `merge` / 砍分支 / `revert`
+   - 發布: `publish` / `deploy` / `release` / `gh pr create` / `gh issue create` /
+     `npm publish` / `推送` / `推 repo`
+   - 檔案: `rm` / `rm -rf` / `刪除` / `清空` （目錄 / 檔案層級，非 DB）
+   - schema 異動非破壞性: `ALTER TABLE` / `CREATE TABLE` / migration
 2. **機密問詢**：畫面要求密碼／API key／個資而你不可能知道 →
    `skip` value=`needs-secret`。
 3. **❯ <已有文字> 場景禁 text**：input box 已有草稿時，`text` 是 append
@@ -565,12 +579,15 @@ DEFAULTS: dict[str, Any] = {
     # `prompt_mode = "legacy"` in config.toml or WATCHER_PROMPT_MODE=legacy.
     "prompt_mode": "autonomous",
     # Safety gate: when true (default), the prompt instructs codex to `skip`
-    # on irreversible-keyword narratives (rm / drop / force / push / merge /
-    # release / etc.) and the user-narrowed-door labels (`窄門 (a)/(b)/(c)`,
-    # `不可逆操作`, `irreversible`). Set to false for full-auto mode where
-    # codex answers on those screens too. Correctness guards (secret prompts,
-    # ❯ already-filled append-bug, unclear-UI, sequence cap, survey modal)
-    # are NOT toggled by this flag — they stay on either way.
+    # ONLY on database-destructive SQL narratives (DROP TABLE / DROP DATABASE /
+    # TRUNCATE TABLE / DELETE FROM-without-WHERE / 刪資料庫 / 清空資料庫) and
+    # the user-narrowed-door labels (`窄門 (a)/(b)/(c)`, `不可逆操作`,
+    # `irreversible`). Everyday dev flow (git push / force-push / reset --hard /
+    # merge / publish / deploy / rm / 刪檔案 / commit) is NOT gated.
+    # Set to false for full-auto mode where codex answers on DB-destructive
+    # screens too. Correctness guards (secret prompts, ❯ already-filled
+    # append-bug, unclear-UI, sequence cap, survey modal) are NOT toggled by
+    # this flag — they stay on either way.
     "safety_gate_enabled": True,
     "hr_min_length": 50,
     "socket_enabled": True,
@@ -1520,13 +1537,12 @@ def _format_session_context(meta: dict[str, str] | None) -> str:
 # cap, survey modal) stay in force — they are not user-gating policy.
 SAFETY_GATE_OFF_OVERRIDE = """
 ═══ ⚠️ 用戶授權：全自動模式（safety_gate_enabled=false） ═══
-用戶已在 config.toml 顯式設定 `safety_gate_enabled = false`，授權 codex 在不可逆
-與外部發布類動作上也照常自動回應。下方規則一律失效（請忽略 → 改回正常決策）：
+用戶已在 config.toml 顯式設定 `safety_gate_enabled = false`，授權 codex 連
+資料庫破壞性 SQL 與用戶窄門標籤也照常自動回應。下方規則一律失效：
 
-- 「不可逆關鍵字 / dangerous-narrative」（rm / drop / force / 刪除 / 砍掉 /
-  DROP TABLE / reset --hard / 強推 / --force-push / truncate / push / publish /
-  deploy / release / merge / gh pr create / gh issue create / npm publish / 推送 /
-  推 repo / 推上去 等等）→ 不再因關鍵字 skip，依畫面正常給 action。
+- 「資料庫破壞性 SQL / dangerous-narrative」（DROP TABLE / DROP DATABASE /
+  DROP SCHEMA / TRUNCATE TABLE / DELETE FROM 無 WHERE / 刪資料庫 / 清空資料庫
+  / 砍掉整張表）→ 不再因關鍵字 skip，依畫面正常給 action。
 - 「窄門 (a) / 窄門 (b) / 窄門 (c) / 不可逆操作 / irreversible」narrative 標籤 →
   視為一般 narrative，不因標籤本身 skip。
 - 「計畫被截斷 → No, keep planning」的保守反射 → 改依畫面提示正常決策（例如
