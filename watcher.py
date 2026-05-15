@@ -189,7 +189,7 @@ DEFAULT_QUESTION_MARKERS: tuple[str, ...] = (
     "選哪", "選擇",
 
     # 下一步
-    "下一步", "接下來", "後續", "for future", "remaining", "剩下", "剩餘"
+    "下一", "接下來", "後續", "for future", "remaining", "剩下", "剩餘", "next round", "follow-up", "follow up"
 )
 NUMBERED_LIST_RE = re.compile(r"^\s*\d+[.)]\s")
 
@@ -283,7 +283,8 @@ log = logging.getLogger("watcher")
 def _build_markers(cfg: dict[str, Any]) -> list[str]:
     extras = cfg.get("skip_predictor_extra_markers") or []
     extra_lc = [str(m).lower() for m in extras if str(m).strip()]
-    return [*DEFAULT_QUESTION_MARKERS, *extra_lc]
+    default_lc = [m.lower() for m in DEFAULT_QUESTION_MARKERS]
+    return [*default_lc, *extra_lc]
 
 
 def predict_skip(
@@ -293,20 +294,26 @@ def predict_skip(
     markers: list[str],
 ) -> str | None:
     """Return a reason string when we predict codex would answer `skip`,
-    otherwise None. Conservative by design: only short-circuits when the
-    cleaned screen is literally empty — every other case (questions, menus,
-    narrative chunks, idle-looking task lists) is passed to codex so it can
-    decide for itself whether to skip, push the conversation forward with a
-    short reply, or pick a menu option. `markers` / `lookback` are kept in
-    the signature for backward compat (config-driven) but no longer drive
-    the decision."""
-    del lookback, markers  # kept for signature compat; behaviour now codex-driven
+    otherwise None. Only applies to `input` classification (menus always
+    have numbered options worth presenting to codex).
+
+    Short-circuits to skip when the cleaned screen's last `lookback`
+    nonempty lines contain NEITHER any `markers` substring (case-insensitive)
+    NOR a numbered list line (`1.` / `1)` style). Markers are matched
+    case-insensitively: caller is expected to lowercase them (see
+    `_build_markers`), and we lowercase the screen tail here."""
     if classification != "input":
         return None
     nonempty = [l for l in clean_screen.splitlines() if l.strip()]
     if not nonempty:
         return "empty cleaned screen"
-    return None
+    tail = nonempty[-lookback:] if lookback and lookback > 0 else nonempty
+    tail_text = "\n".join(tail).lower()
+    if any(m in tail_text for m in markers):
+        return None
+    if any(NUMBERED_LIST_RE.match(l) for l in tail):
+        return None
+    return "no question markers in lookback"
 
 
 def _screen_hash(clean_screen: str, context: str = "") -> str:
