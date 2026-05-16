@@ -118,6 +118,8 @@ codex exec --ephemeral --skip-git-repo-check --sandbox read-only \
 
 **為何不全改成 autonomous 砍 legacy**：autonomous 對既有穩定 case（一般編號選單、純 narrative 推進）可能 regress，保 legacy 作 escape hatch；確認 autonomous 在你環境穩定後再考慮刪。改 prompt 時兩個 template 都改、別只改一邊。
 
+**Defer-to-Claude fallback**：當 Claude 提了開放問題（"你想怎麼做？" / "要走哪個方向？"）但 codex 沒有畫面外資訊可依、又不命中安全閘時，兩個 template 都允許回 `text` value=`依照你的建議`（英文畫面 `go with your recommendation`），把決策權還給 Claude 並推進。比 `skip` 強——`skip` 會卡住自動化、user 還是要手動回。**不適用**：`❯ <已有文字>`（會 append 串字串）、機密問詢、編號選單 / multi-stage selector 已能判時——這些場景仍走原本決策路徑。
+
 ### 安全閘開關（`safety_gate_enabled`）
 
 `build_prompt` 依 `cfg["safety_gate_enabled"]` 決定是否在 prompt 開頭注入 `SAFETY_GATE_OFF_OVERRIDE` 區塊。**窄門範圍刻意極窄**——只擋資料庫破壞性 SQL 與用戶顯式窄門標籤，日常 dev 流程一律放行。

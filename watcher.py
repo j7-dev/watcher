@@ -64,6 +64,11 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
   → `text`，value=具體推進指令（如 "繼續"、"開始 Week 2"、"執行下一步"）。
 - 陳述句 + 只是工作報告 / 無明確下一步（純成果總結、文件清單、task tick list）
   → `text`，value="繼續"，推 Claude 自行決定下一步。
+- **defer-to-Claude fallback**：Claude 提了開放問題（"你想怎麼做？"、
+  "要走哪個方向？"）但 codex 真的沒有畫面外資訊可依、又不命中安全閘 →
+  `text`，value=`依照你的建議`（英文畫面 `go with your recommendation`）。
+  把決策權還給 Claude，比 `skip` 強——`skip` 會卡住自動化。**不適用**
+  `❯ <已有文字>`（會 append 串字串）、機密問詢、編號選單已能判時。
 - **安全閘**：陳述句裡若提到**資料庫破壞性 SQL**（`DROP TABLE` / `DROP DATABASE` /
   `DROP SCHEMA` / `TRUNCATE TABLE` / `DELETE FROM` 無 WHERE 條件 / 刪資料庫 /
   刪 table / 清空資料庫），改 `skip` value=`dangerous-narrative`。
@@ -76,6 +81,8 @@ Claude 的輸出常常是**陳述句而非問句**——它會總結成果、列
   但畫面已列出的選項（A/B、方案一/方案二、編號項）可直接引用做決策。
 - **長度**：純推進（"繼續" / "好" / "OK"）≤ 6 字；具體選擇 ≤ 30 字。
 - **語言匹配**：畫面中文 → 中文；畫面英文 → 英文（"continue" / "do A" / "skip B"）。
+- **defer-to-Claude 套語**（fallback 用）：中文 `依照你的建議`、
+  英文 `go with your recommendation`。短、中性、把決策權還給 Claude。
 - **絕對不可用 text 在已填 `❯ <已有文字>` 場景**——那會 append 串成亂碼。
 
 ═══ 符號圖例（畫面已預處理，請依此語意解讀） ═══
@@ -312,12 +319,21 @@ PROMPT_TEMPLATE_AUTONOMOUS = """\
     - 含 A/B 明確選擇 → `text` 自主選一個（"做 A" / "先 X"）。
     - 純報告 / 無分岔 → `text` value=`繼續` / `OK` / `continue`。
 - 真正純閒置（畫面空、無 Claude 輸出）→ `skip` value=`idle`。
+- **defer-to-Claude fallback**：Claude 提了開放問題（"你想怎麼做？"、
+  "要走 A 還是 B 還是其他方案？"）但 codex 沒有畫面外資訊可依、又**不屬於**
+  C 段安全閘命中項 → `text` value=`依照你的建議`（畫面英文則 `go with your
+  recommendation`）。讓 Claude 自行決定下一步並推進，比 `skip` 強——`skip`
+  會卡住自動化、user 還是要手動回。**前提**：此 fallback 不適用 `❯ <已有
+  文字>`（C-3）、機密問詢（C-2）、編號選單（B-2/3 已能判）、multi-stage
+  selector（footer 明示 → 仍走 B 段）。
 
 ═══ 推進語規則 ═══
 - **避免猜畫面外細節**：不指定畫面看不到的 file 名 / 數字 / 路徑 / 變數；
   但畫面已列出的選項（A/B、編號項）可直接引用做決策。
 - **長度**：純推進（"繼續" / "好" / "OK"）≤ 6 字；具體選擇 ≤ 30 字。
 - **語言匹配**：畫面中文 → 中文；畫面英文 → 英文（"continue" / "do A"）。
+- **defer-to-Claude 套語**（D 段 fallback 用）：中文 `依照你的建議`、
+  英文 `go with your recommendation`。短、中性、把決策權還給 Claude。
 
 ═══ 選擇偏好（多個合理答案時的偏序） ═══
 - **提權 vs fallback**：選「純軟體 fallback」而非 sudo / 全域提權，
